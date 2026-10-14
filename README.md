@@ -23,7 +23,7 @@ The console polls local state every five seconds. Account checks and model synch
 
 ## Quick start
 
-Requires **Node.js 22 or newer** and a Logicc account/session you can use.
+Requires **Node.js 22 or newer** and a Logicc account/session you can use. For a container-based setup without installing Node.js on the host, see [Docker deployment](#docker-deployment).
 
 ```bash
 git clone https://github.com/JamesZhaoY/logicc2api.git
@@ -43,7 +43,67 @@ To select a different port:
 node server.mjs 18790
 ```
 
-The server binds only to `127.0.0.1`. Command-line port selection takes precedence over `PORT`.
+Native startup binds to `127.0.0.1` by default. Command-line port selection takes precedence over `PORT`.
+
+## Docker deployment
+
+Requires Docker Engine with the Compose plugin, or Docker Desktop. The repository includes a [Dockerfile](Dockerfile) and [compose.yaml](compose.yaml); the image is built locally from source.
+
+### Start with Docker Compose
+
+```bash
+git clone https://github.com/JamesZhaoY/logicc2api.git
+cd logicc2api
+docker compose up -d --build --wait
+```
+
+If you already cloned the repository, run the last command from its root directory. Open **<http://127.0.0.1:18789/>**, add an account, and use **`http://127.0.0.1:18789/v1`** as your client's Base URL.
+
+The image uses Node.js 24 Alpine and runs as the non-root `node` user. Inside the container, `LOGICC_HOST=0.0.0.0` allows Docker's port forwarding to reach the server. Compose publishes the port only on the host's `127.0.0.1`. The image health check calls `/health`; a healthy container means the service is running, not that an upstream account has passed a check.
+
+### Change the port or API key
+
+Create a local `.env` file next to `compose.yaml`, for example:
+
+```dotenv
+LOGICC_PORT=18790
+LOGICC_API_KEY=replace-with-your-own-key
+```
+
+```bash
+docker compose up -d --wait
+```
+
+Then use `http://127.0.0.1:18790/` and supply the configured Bearer key for `/v1/*`. Both variables are optional; the defaults are port `18789` and no API key requirement. Use another port if a native instance already occupies `18789`. Keep the settings in `.env` so subsequent Compose commands use the same configuration. Compose reads these values through [environment interpolation](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/); the file is ignored by Git and excluded from the image build.
+
+`LOGICC_PORT` changes the container port and published port together because the server validates the HTTP Host port. When writing a custom `docker run` command, keep the two ports equal and set `PORT` inside the container if changing the default. An API key protects `/v1/*`; it does not add an admin login to the console.
+
+### Data, logs, and upgrades
+
+Compose stores `/app/data` in the named volume `logicc2api_logicc-data` (or `<project-name>_logicc-data` when using `-p`). Accounts, request records, and rotated credentials survive container recreation. The image build excludes your local `data/`, `.env`, logs, and backups; an existing native installation is not imported automatically. Add your accounts through the console when starting a fresh container.
+
+```bash
+# Status and logs
+docker compose ps
+docker compose logs -f --tail=100 logicc2api
+
+# Update source and rebuild; retain the same data volume
+git pull --ff-only
+docker compose up -d --build --wait
+
+# Stop and remove containers while keeping account data
+docker compose down
+```
+
+Do not add `--volumes` / `-v` to `docker compose down` unless you intend to delete the account data. Named volume behavior is documented in [Docker's volume guide](https://docs.docker.com/engine/storage/volumes/).
+
+For deployment on a remote server, access the local-only console through an SSH tunnel from your computer:
+
+```bash
+ssh -N -L 18789:127.0.0.1:18789 your-user@your-server
+```
+
+Then open `http://127.0.0.1:18789/` on your computer. Adjust both port numbers if you configured another port. The existing local-origin checks remain in effect; public-domain hosting requires a separate authentication/access design.
 
 ## Account credentials
 
@@ -146,6 +206,7 @@ Upstream token usage is converted when available. When it is absent, API respons
 | Environment variable | Purpose |
 | --- | --- |
 | `PORT` | Listening port; default `18789` |
+| `LOGICC_HOST` | Bind address; native default `127.0.0.1`, container default `0.0.0.0` |
 | `LOGICC_DATA_FILE` | State path; default `data/state.json` in the project directory |
 | `LOGICC_API_KEY` | Optional Bearer key required for `/v1/*` |
 | `LOGICC_API_BASE` | Upstream base URL; default `https://app.logicc.com/api` |
@@ -156,7 +217,7 @@ Upstream token usage is converted when available. When it is absent, API respons
 | `LOGICC_TOKEN_FILE` | External JWT file for the environment-imported account |
 | `LOGICC_TOKEN_CMD` | External JWT refresh command for that account; configured only through the process environment |
 
-The project does not load `.env` files automatically. Export variables in your shell or, on a compatible Node.js version, start with `node --env-file=.env server.mjs`.
+Native Node.js startup does not load `.env` files automatically. Export variables in your shell or, on a compatible Node.js version, start with `node --env-file=.env server.mjs`. Docker Compose reads `.env` for the `LOGICC_PORT` and `LOGICC_API_KEY` mappings above; `LOGICC_PORT` is a Compose setting, not a native server setting. Other environment variables must be explicitly added to the Compose service if needed.
 
 Existing saved accounts take precedence over initial environment credentials, so old environment values do not overwrite rotated cookies. If you use an external refresh command or token file, keep providing its configuration when starting the service.
 
@@ -181,6 +242,8 @@ server.mjs              HTTP routes, upstream requests, and protocol conversion
 pool.mjs                Account storage, credential refresh, scheduling, and metrics
 public/                 Web console, served without a build step
 test/adapter.test.mjs    Integration and protocol checks
+Dockerfile              Non-root container image and service health check
+compose.yaml            Local port mapping and persistent account data
 ```
 
 ## License

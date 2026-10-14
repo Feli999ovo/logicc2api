@@ -316,8 +316,9 @@ export function createAdapter({ env = process.env, dataFile = env.LOGICC_DATA_FI
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const port = Number(process.argv[2] || process.env.PORT || 18789);
+  const host = process.env.LOGICC_HOST || '127.0.0.1';
   const { server } = createAdapter();
-  server.listen(port, '127.0.0.1', () => {
+  server.listen(port, host, () => {
     console.log(`Logicc console: http://127.0.0.1:${server.address().port}/`);
     console.log(`OpenAI API:    http://127.0.0.1:${server.address().port}/v1`);
   });

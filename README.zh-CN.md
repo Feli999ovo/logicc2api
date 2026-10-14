@@ -23,7 +23,7 @@
 
 ## 快速开始
 
-需要 **Node.js 22 或更新版本**，以及可使用的 Logicc 账户与会话。
+需要 **Node.js 22 或更新版本**，以及可使用的 Logicc 账户与会话。如果不想在宿主机安装 Node.js，可使用下方的 [Docker 部署](#docker-部署)。
 
 ```bash
 git clone https://github.com/JamesZhaoY/logicc2api.git
@@ -43,7 +43,67 @@ npm start
 node server.mjs 18790
 ```
 
-服务只监听 `127.0.0.1`，命令行端口优先于环境变量 `PORT`。
+直接使用 Node.js 启动时默认监听 `127.0.0.1`，命令行端口优先于环境变量 `PORT`。
+
+## Docker 部署
+
+需要安装带 Compose 插件的 Docker Engine，或 Docker Desktop。仓库已提供 [Dockerfile](Dockerfile) 和 [compose.yaml](compose.yaml)，镜像从源码在本机构建。
+
+### 使用 Docker Compose 启动
+
+```bash
+git clone https://github.com/JamesZhaoY/logicc2api.git
+cd logicc2api
+docker compose up -d --build --wait
+```
+
+如果已经克隆仓库，在项目根目录执行最后一条命令即可。启动后打开 **<http://127.0.0.1:18789/>**，在号池中添加账户，客户端 Base URL 填 **`http://127.0.0.1:18789/v1`**。
+
+镜像基于 Node.js 24 Alpine，使用非 root 的 `node` 用户运行。容器内设置 `LOGICC_HOST=0.0.0.0`，使 Docker 端口转发可以连接服务；Compose 只把端口发布到宿主机的 `127.0.0.1`。镜像通过 `/health` 检查服务是否存活；容器显示 healthy 不代表上游账户已经通过连接检测。
+
+### 修改端口或设置 API Key
+
+在 `compose.yaml` 同级创建本地 `.env` 文件，例如：
+
+```dotenv
+LOGICC_PORT=18790
+LOGICC_API_KEY=replace-with-your-own-key
+```
+
+```bash
+docker compose up -d --wait
+```
+
+之后访问 `http://127.0.0.1:18790/`，调用 `/v1/*` 时携带配置的 Bearer Key。两个变量均可省略，默认端口为 `18789`、不要求 API Key。如果本机原有 Node.js 服务已占用 `18789`，请选择其他端口。把配置保存在 `.env` 中，可以保证后续 Compose 命令使用同一组设置。Compose 通过[环境变量插值](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/)读取配置；该文件被 Git 忽略，也不会进入镜像构建。
+
+由于服务会校验 HTTP Host 中的端口，`LOGICC_PORT` 会同步调整容器内和宿主机端口。自行编写 `docker run` 命令时，也应保持两侧端口一致；修改默认端口时需设置容器内的 `PORT`。API Key 仅保护 `/v1/*`，不会为控制台增加管理员登录。
+
+### 数据、日志与更新
+
+Compose 将 `/app/data` 保存到命名卷 `logicc2api_logicc-data`；使用 `-p` 自定义项目名时，卷名为 `<项目名>_logicc-data`。容器重建后，账户、请求记录和轮换后的凭据仍会保留。镜像构建会排除本地 `data/`、`.env`、日志和备份，不会自动导入原有 Node.js 实例的数据；新容器请通过控制台添加账户。
+
+```bash
+# 查看状态和日志
+docker compose ps
+docker compose logs -f --tail=100 logicc2api
+
+# 更新源码并重建，继续使用原有数据卷
+git pull --ff-only
+docker compose up -d --build --wait
+
+# 停止并移除容器，保留号池数据
+docker compose down
+```
+
+只有确定要删除号池数据时，才给 `docker compose down` 添加 `--volumes` / `-v`。命名卷行为可参考 [Docker 数据卷文档](https://docs.docker.com/engine/storage/volumes/)。
+
+部署在远程服务器时，可在自己的电脑上通过 SSH 隧道访问仅限本机的控制台：
+
+```bash
+ssh -N -L 18789:127.0.0.1:18789 your-user@your-server
+```
+
+然后在电脑上打开 `http://127.0.0.1:18789/`。如果修改了端口，请同步调整两处端口号。现有本机来源检查仍然生效；公网域名访问需要另行设计身份认证和访问控制。
 
 ## 账户凭据
 
@@ -146,6 +206,7 @@ curl -N http://127.0.0.1:18789/v1/chat/completions \
 | 环境变量 | 用途 |
 | --- | --- |
 | `PORT` | 监听端口，默认 `18789` |
+| `LOGICC_HOST` | 监听地址；Node.js 直接启动默认 `127.0.0.1`，容器内默认 `0.0.0.0` |
 | `LOGICC_DATA_FILE` | 数据文件路径，默认项目目录下 `data/state.json` |
 | `LOGICC_API_KEY` | 可选，配置后 `/v1/*` 必须携带对应 Bearer Key |
 | `LOGICC_API_BASE` | 上游基址，默认 `https://app.logicc.com/api` |
@@ -156,7 +217,7 @@ curl -N http://127.0.0.1:18789/v1/chat/completions \
 | `LOGICC_TOKEN_FILE` | 环境变量导入账户使用的外部 JWT 文件 |
 | `LOGICC_TOKEN_CMD` | 该账户的外部 JWT 刷新命令，仅从进程环境读取，页面不可配置 |
 
-程序不自动加载 `.env` 文件。请在 shell 中导出环境变量，或在支持的 Node.js 版本中使用 `node --env-file=.env server.mjs` 启动。
+直接使用 Node.js 启动时，程序不自动加载 `.env` 文件。请在 shell 中导出环境变量，或在支持的 Node.js 版本中使用 `node --env-file=.env server.mjs` 启动。Docker Compose 会读取 `.env` 并映射上文的 `LOGICC_PORT` 和 `LOGICC_API_KEY`；`LOGICC_PORT` 仅用于 Compose，不是 Node.js 服务直接读取的变量。如需其他环境变量，应显式添加到 Compose 服务配置中。
 
 已有账户数据优先于初始环境凭据，避免旧环境变量覆盖已轮换的 Cookie。使用外部刷新命令或 JWT 文件的账户，重启时仍需提供相应配置。
 
@@ -181,6 +242,8 @@ server.mjs              HTTP 路由、上游调用和协议转换
 pool.mjs                账户存储、凭据刷新、调度和统计
 public/                 无需构建的 Web 控制台
 test/adapter.test.mjs    集成与协议测试
+Dockerfile              非 root 容器镜像和健康检查
+compose.yaml            本机端口映射与号池数据持久化
 ```
 
 ## 许可证
