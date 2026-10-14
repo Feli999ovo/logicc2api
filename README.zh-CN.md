@@ -2,6 +2,8 @@
 
 [English](README.md) · **简体中文**
 
+> **免责声明：** 使用前请阅读[《免责声明与使用责任说明》](DISCLAIMER.md)，了解账户授权、第三方服务风险、数据处理及责任限制。软件许可继续适用 [MIT License](LICENSE)。
+
 为 [Logicc](https://app.logicc.com) 提供 OpenAI 兼容接口的本地代理，内置号池管理和 Web 控制台。将 Logicc 的 AI SDK v6 数据流转换成 OpenAI Chat Completions 响应，集中查看账户状态、流量、模型延迟和请求日志。
 
 使用 Node.js 与原生 HTML/CSS/JavaScript 实现。**零运行时依赖，无需数据库，无需前端构建。** 当前页面为简体中文，同时提供中英文介绍文档。
