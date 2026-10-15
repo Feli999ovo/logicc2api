@@ -15,6 +15,7 @@
 | 协议兼容 | 模型列表，Chat Completions、Responses、Messages 的 JSON / SSE 接口 |
 | 客户端工具调用 | 标准 tool_calls / function_call / tool_use，以及工具结果回传 |
 | 号池管理 | 账户增删改、启停、搜索、JSON 批量导入 |
+| 上游助手提示词 | 读取、备份、编辑并发布助手 systemPrompt，按账号选择代理默认助手 |
 | 凭据刷新 | 按需刷新 Clerk JWT、合并同账户的并发刷新、保存轮换后的 Cookie |
 | 账户调度 | 最低并发优先，同等并发轮询，异常账户自动冷却 |
 | 运行看板 | 请求趋势、成功率、首字延迟和账户可用性 |
@@ -269,6 +270,22 @@ curl http://127.0.0.1:18789/v1/messages \
 
 协议字段参考 [OpenAI Function calling](https://developers.openai.com/api/docs/guides/function-calling)、[Responses 流式事件](https://developers.openai.com/api/reference/resources/responses/streaming-events) 和 [Anthropic Messages 流式协议](https://platform.claude.com/docs/en/build-with-claude/streaming)。
 
+## 上游助手提示词
+
+打开控制台的 **开发者 → 助手提示词**，或直接访问 <http://127.0.0.1:18789/#prompts>。
+
+1. 选择号池账号，从“我的助手库”“组织共享”或“官方模板”读取该账号能访问的助手。
+2. 选择助手后，页面从 Logicc 助手接口读取真实 `systemPrompt`，并标明编辑权限。上游没有提供原文时会明确显示，不会生成替代原文。
+3. `owner` / `editor` 可以编辑并“保存并发布”；其他权限只能查看。保存遵循上游的“读取/创建草稿 → 更新 systemPrompt → 发布 → 重新读取确认”流程，保留模型、工具、附件等其他设置。
+4. 如果上游已经有未发布草稿，页面会展示该草稿并提示：发布会一并发布草稿中已有的改动。上游在读取后被其他人修改时，保存会返回冲突，需重新读取核对。
+5. 需要时点击“设为代理默认助手”。此后，分配到该账号的新代理请求会在创建上游聊天时携带助手 ID；Chat Completions、Responses 和 Messages 均适用。请求未指定模型或使用 `default` 时优先使用所选助手的模型；显式传入的模型仍由请求决定。“取消默认”恢复普通聊天。
+
+没有助手时，可以在页面新建私有助手。新助手默认关闭上游网页搜索和图片生成，避免额外工具行为；以后可在 Logicc 网站配置这些能力。
+
+提示词副本与默认助手选择独立保存在数据目录的 `assistant-prompts.json` 中，与账号凭据文件分开。保留最近读取的最多 200 个助手快照；每个快照保存首次读取原文和最近读取内容。文件权限为 `0600`，Docker 数据卷会保留这些配置，不会上传 Git。点击“将备份载入编辑器”只修改编辑区，仍需点击保存才会发布到上游。
+
+这里编辑的是**上游助手指令**，不是 Logicc 平台隐藏的内置系统提示词。平台内置提示词目前未取得可验证原文，也未发现修改入口。助手自定义指令的具体遵循程度仍取决于上游平台和模型。
+
 ## 调度与刷新行为
 
 - 从已启用、符合调度条件的账户中，优先选择正在处理请求数最少的账户；同等并发采用轮询。同一次聊天固定使用一个账户。
@@ -317,6 +334,7 @@ npm test
 ```text
 server.mjs              HTTP 路由、上游调用和 Responses 临时缓存
 protocols.mjs           三种协议的请求、工具调用与 JSON / SSE 转换
+assistants.mjs          上游助手草稿发布、独立提示词备份与默认助手配置
 pool.mjs                账户存储、凭据刷新、调度和统计
 public/                 无需构建的 Web 控制台
 test/adapter.test.mjs    集成与协议测试

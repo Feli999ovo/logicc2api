@@ -15,6 +15,7 @@ Built with Node.js and plain HTML/CSS/JavaScript. **No runtime dependencies, dat
 | Protocol compatibility | Model listing; JSON and SSE for Chat Completions, Responses, and Messages |
 | Client tool calls | Standard tool_calls / function_call / tool_use and matching tool-result round trips |
 | Account pool | Add, edit, remove, enable/disable, search, and bulk-import accounts |
+| Upstream assistant prompts | Read, back up, edit, and publish assistant systemPrompt; select a default assistant per account |
 | Credential refresh | On-demand Clerk JWT refresh, shared concurrent refreshes, and persistence of rotated client cookies |
 | Scheduling | Prefer the least-busy accounts, round-robin between ties, and cool down failing accounts |
 | Dashboard | Request trends, success rate, time to first text, and account availability |
@@ -269,6 +270,22 @@ Supported choices include `auto`, `none`, `required` / Messages `any`, named too
 
 Protocol references: [OpenAI function calling](https://developers.openai.com/api/docs/guides/function-calling), [Responses streaming events](https://developers.openai.com/api/reference/resources/responses/streaming-events), and [Anthropic Messages streaming](https://platform.claude.com/docs/en/build-with-claude/streaming).
 
+## Upstream assistant prompts
+
+Open **开发者 → 助手提示词** (Developer → Assistant prompts), or visit <http://127.0.0.1:18789/#prompts>.
+
+1. Choose a pool account and browse its library, organization-shared assistants, or curated templates.
+2. Selecting an assistant reads the actual `systemPrompt` from Logicc and displays the account's permissions. If upstream does not expose the text, the UI says so instead of generating substitute instructions.
+3. Owners and editors can save and publish; other permissions are read-only. Saving follows the upstream draft workflow: read/create draft, update only `systemPrompt`, publish, and read back to verify. Model, tools, files, and other settings are preserved.
+4. An existing upstream draft is shown explicitly. Publishing also publishes any changes already in that draft. If the upstream configuration changes after you load it, the update is rejected as a conflict so you can reload and review it.
+5. Optionally select **设为代理默认助手** (Use as proxy default). New proxy requests assigned to this account create their upstream chat with that assistant ID, across all three protocols. When `model` is omitted or `default`, the selected assistant's model is preferred; an explicit request model takes precedence. Clearing the default restores ordinary chats.
+
+If the library is empty, create a private assistant from this page. New assistants start with upstream web search and image generation disabled; those capabilities can be changed later on the Logicc website.
+
+Prompt snapshots and default selections are stored separately in `assistant-prompts.json` beside the account data file. It retains up to 200 recently read assistant snapshots, including each retained assistant's first-read text and latest text. The file uses `0600` permissions, persists in the Docker data volume, and is excluded from Git. Loading the first-read backup into the editor does not change upstream until you explicitly save.
+
+These are **upstream assistant instructions**, not Logicc's hidden platform-wide system prompt. The latter has not been obtained from a verifiable source, and no modification endpoint has been identified. How precisely custom assistant instructions are followed still depends on the upstream platform and model.
+
 ## Scheduling and refresh behavior
 
 - Enabled, eligible accounts with the fewest in-flight requests are preferred. Ties use round-robin selection, and one account handles the entire chat request.
@@ -317,6 +334,7 @@ Tests use Node's built-in test runner and a local mock upstream. They cover acco
 ```text
 server.mjs              HTTP routes, upstream calls, and temporary Responses history
 protocols.mjs           Request, tool-call, JSON, and SSE conversion for all three APIs
+assistants.mjs          Upstream drafts/publication, separate prompt backups, and assistant defaults
 pool.mjs                Account storage, credential refresh, scheduling, and metrics
 public/                 Web console, served without a build step
 test/adapter.test.mjs    Integration and protocol checks

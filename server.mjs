@@ -6,6 +6,7 @@ import { dirname, resolve } from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
 import { AccountPool, HttpError, claims, safeError } from './pool.mjs';
 import { normalizeRequest, buildPrompt, parseToolOutput, ProtocolOutput, errorPayload } from './protocols.mjs';
+import { AssistantPrompts } from './assistants.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 
@@ -66,6 +67,7 @@ function usageOf(event) {
 export function createAdapter({ env = process.env, dataFile = env.LOGICC_DATA_FILE || resolve(ROOT, 'data/state.json') } = {}) {
   const pool = new AccountPool(dataFile, env);
   const apiBase = (env.LOGICC_API_BASE || 'https://app.logicc.com/api').replace(/\/+$/, '');
+  const assistantPrompts = new AssistantPrompts(resolve(dirname(dataFile), 'assistant-prompts.json'), upstream);
 
   async function upstream(account, path, { method = 'GET', body, stream = false, signal } = {}, retry = true) {
     const token = await pool.tokenFor(account);
@@ -171,14 +173,19 @@ export function createAdapter({ env = process.env, dataFile = env.LOGICC_DATA_FI
     const prompt = buildPrompt(request);
     if (Buffer.byteLength(prompt) > 2 * 1024 * 1024) throw new HttpError(413, '合并后的上下文过大，请缩短历史或开始新会话');
     await track(req, res, 'chat', async (account, trace, signal) => {
+      const assistant = assistantPrompts.defaultFor(account.id);
       if (!request.model || request.model === 'default') {
-        const models = await modelsFor(account, signal);
-        request.model = (models.find(m => m.isDefault) || models[0]).id;
+        if (assistant?.modelId) request.model = assistant.modelId;
+        else {
+          const models = await modelsFor(account, signal);
+          request.model = (models.find(m => m.isDefault) || models[0]).id;
+        }
       }
       trace.model = request.model;
       trace.stream = request.stream;
       trace.protocol = protocol;
-      const chatResponse = await upstream(account, 'chats', { method: 'POST', body: {}, signal });
+      if (assistant) { trace.assistantId = assistant.id; trace.assistantName = assistant.name; }
+      const chatResponse = await upstream(account, 'chats', { method: 'POST', body: assistant ? { assistantId: assistant.id } : {}, signal });
       const createdChat = await chatResponse.json();
       const chatId = typeof createdChat === 'string' ? createdChat : createdChat.id;
       if (typeof chatId !== 'string' || !chatId) throw new HttpError(502, '上游创建会话未返回 ID');
@@ -275,8 +282,28 @@ export function createAdapter({ env = process.env, dataFile = env.LOGICC_DATA_FI
         if (req.headers['x-logicc-admin'] !== '1') throw new HttpError(403, '控制台请求缺少 X-Logicc-Admin 请求头');
         if (!['GET', 'DELETE'].includes(req.method) && !req.headers['content-type']?.startsWith('application/json')) throw new HttpError(415, '管理接口需要 application/json');
         if (url.pathname === '/api/state' && req.method === 'GET') return json(res, 200, {
-          ...pool.snapshot(), service: { baseUrl: `http://${host}/v1`, upstream: apiBase, apiKeyRequired: Boolean(env.LOGICC_API_KEY), strategy: 'least-busy-round-robin' },
+          ...pool.snapshot(), assistantDefaults: assistantPrompts.data.defaults, service: { baseUrl: `http://${host}/v1`, upstream: apiBase, apiKeyRequired: Boolean(env.LOGICC_API_KEY), strategy: 'least-busy-round-robin' },
         });
+        const assistantRoute = /^\/api\/accounts\/([\w-]+)\/(assistants|default-assistant)(?:\/([\w-]+))?$/.exec(url.pathname);
+        if (assistantRoute) {
+          const [, accountId, resource, assistantId] = assistantRoute;
+          const account = pool.account(accountId);
+          const signal = AbortSignal.timeout(60000);
+          pool.runtimeFor(accountId).inFlight++;
+          try {
+            if (resource === 'default-assistant' && !assistantId && req.method === 'PUT') {
+              const body = await readJson(req);
+              return json(res, 200, { defaultAssistant: await assistantPrompts.selectDefault(account, body?.assistantId, signal) });
+            }
+            if (resource === 'assistants') {
+              if (!assistantId && req.method === 'GET') return json(res, 200, await assistantPrompts.list(account, { type: url.searchParams.get('type') || 'library', cursor: url.searchParams.get('cursor'), query: url.searchParams.get('query'), signal }));
+              if (!assistantId && req.method === 'POST') return json(res, 201, { assistant: await assistantPrompts.create(account, await readJson(req), signal) });
+              if (assistantId && req.method === 'GET') return json(res, 200, { assistant: await assistantPrompts.read(account, assistantId, signal) });
+              if (assistantId && req.method === 'PUT') return json(res, 200, { assistant: await assistantPrompts.save(account, assistantId, await readJson(req), signal) });
+            }
+            throw new HttpError(404, '助手管理接口不存在');
+          } finally { pool.release(account); }
+        }
         if (url.pathname === '/api/accounts' && req.method === 'POST') {
           const input = await readJson(req);
           return json(res, 201, { account: pool.addMany([input])[0] });
@@ -289,7 +316,7 @@ export function createAdapter({ env = process.env, dataFile = env.LOGICC_DATA_FI
         if (match) {
           const [, id, action] = match;
           if (req.method === 'PATCH' && !action) return json(res, 200, { account: pool.update(id, await readJson(req)) });
-          if (req.method === 'DELETE' && !action) { pool.remove(id); return json(res, 200, { ok: true }); }
+          if (req.method === 'DELETE' && !action) { pool.remove(id); assistantPrompts.forgetAccount(id); return json(res, 200, { ok: true }); }
           if (req.method === 'POST' && action) {
             const result = await track(req, res, 'check', async (account, trace, signal) => {
               if (action === 'refresh') await pool.tokenFor(account, true);

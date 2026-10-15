@@ -25,7 +25,7 @@ const time = value => value ? new Date(value).toLocaleTimeString('zh-CN', {hour1
 const date = value => value ? new Date(value).toLocaleString('zh-CN', {hour12:false}) : '—';
 const ago = value => !value ? '尚未检测' : Date.now()-value < 60000 ? '刚刚' : Date.now()-value < 3600000 ? `${Math.floor((Date.now()-value)/60000)} 分钟前` : date(value);
 const shortSid = value => value ? `${value.slice(0,10)}…${value.slice(-4)}` : '外部刷新';
-const titles = {overview:'代理概览',accounts:'号池管理',models:'模型与性能',logs:'请求日志',playground:'请求测试',connect:'API 接入'};
+const titles = {overview:'代理概览',accounts:'号池管理',models:'模型与性能',logs:'请求日志',playground:'请求测试',connect:'API 接入',prompts:'助手提示词'};
 const statuses = {ready:'可用',pending:'未检测',retry:'待重试',cooling:'冷却中',error:'异常',expired:'已过期',disabled:'已停用',success:'成功',cancelled:'已取消'};
 const badge = (status, title='') => `<span class="badge ${esc(status)}" title="${esc(title)}">${statuses[status] || esc(status)}</span>`;
 let state, page = location.hash.slice(1) || 'overview', busyCount = 0, loading = false;
@@ -34,7 +34,7 @@ let deleteId, playController, playStarted;
 const busyAccounts = new Set();
 
 async function api(path, { method = 'GET', body } = {}) {
-  const response = await fetch(`/api${path}`, {method, headers:{'X-Logicc-Admin':'1',...(body !== undefined || method === 'POST' ? {'Content-Type':'application/json'} : {})},body:body !== undefined ? JSON.stringify(body) : method === 'POST' ? '{}' : undefined, signal:AbortSignal.timeout(35000)});
+  const response = await fetch(`/api${path}`, {method, headers:{'X-Logicc-Admin':'1',...(body !== undefined || method === 'POST' ? {'Content-Type':'application/json'} : {})},body:body !== undefined ? JSON.stringify(body) : method === 'POST' ? '{}' : undefined, signal:AbortSignal.timeout(path.includes('/assistants')||path.endsWith('/default-assistant')?65000:35000)});
   const result = await response.json();
   if (!response.ok) throw new Error(result.error?.message || `HTTP ${response.status}`);
   return result;
@@ -84,7 +84,8 @@ function render() {
   document.title = `${titles[page]} · Logicc`;
   document.querySelectorAll('[data-page]').forEach(link => { link.classList.toggle('active',link.dataset.page === page); if(link.dataset.page === page) link.setAttribute('aria-current','page'); else link.removeAttribute('aria-current'); });
   if (page === 'playground' && $('#play-form')) return;
-  $('#main').innerHTML = ({overview:overviewPage,accounts:accountsPage,models:modelsPage,logs:logsPage,playground:playgroundPage,connect:connectPage})[page]();
+  if (page === 'prompts' && $('#assistant-prompts-page')) return;
+  $('#main').innerHTML = ({overview:overviewPage,accounts:accountsPage,models:modelsPage,logs:logsPage,playground:playgroundPage,connect:connectPage,prompts:promptsPage})[page]();
 }
 function chart() {
   const max = Math.max(2, ...state.trend.map(b => b.success+b.error));
@@ -155,6 +156,99 @@ function playgroundPage() {
   return heading('发起一次真实请求','直接验证号池、模型与流式响应；测试会消耗上游额度。','','WORKSPACE / PLAYGROUND')+
   `<div class="playground-grid"><form class="panel form-panel" id="play-form"><label>模型<select name="model" required>${state.models.length?state.models.map(m=>`<option value="${esc(m.id)}">${esc(m.id)}</option>`).join(''):'<option value="default">default · 上游默认模型</option>'}</select></label><label>提示词<textarea name="prompt" required placeholder="输入你想发送给模型的消息…">用一句话介绍你自己。</textarea></label>${state.service.apiKeyRequired?'<label>代理 API Key<input type="password" name="apiKey" required autocomplete="off" placeholder="本次请求使用，不保存"></label>':''}<label>内置工具<select name="tool"><option value="">不指定</option><option value="web_search">网页搜索</option><option value="image_generation">图片生成（仅透传）</option></select></label><div class="heading-actions"><button type="submit" class="button primary" id="play-submit">${icon('play')}发送请求</button><button type="button" class="button secondary" data-action="stop-play" id="play-stop" hidden>停止</button></div><p class="field-hint">账户由调度池分配，结果会记录到请求日志。图片工具返回内容以文本形式展示。</p></form><section class="panel output-panel"><div class="panel-heading"><div><h2>模型响应</h2><p>STREAMING RESPONSE</p></div><span class="range-label" id="play-status">等待发送</span></div><pre id="play-output" class="output-placeholder" aria-live="polite">在左侧输入消息，查看实时响应。</pre><div class="output-meta" id="play-meta">连接本地 OpenAI 兼容接口</div></section></div>`;
 }
+let promptAccount = '', promptType = 'library', promptItems = [], promptCursor = null;
+let selectedPrompt = null, promptDraft = '', promptBusy = false, promptError = '', promptLoaded = false, promptNew = false;
+let newPromptName = '', newPromptModel = '';
+const promptDirty = () => promptNew ? Boolean(promptDraft || newPromptName) : selectedPrompt && promptDraft !== (selectedPrompt.systemPrompt || '');
+function keepPromptDraft() { return !promptDirty() || window.confirm('当前提示词有未保存的修改，确定放弃这些修改吗？'); }
+function renderPrompts() { if (page === 'prompts') $('#main').innerHTML = promptsPage(); }
+function promptsPage() {
+  if (!state.accounts.length) return heading('助手提示词','编辑 Logicc 上游助手的指令。','','DEVELOPER / ASSISTANT PROMPTS') + empty('先添加账户','助手从你选择的 Logicc 账户读取。','accounts',addButton);
+  if (!state.accounts.some(a => a.id === promptAccount)) { promptAccount = state.accounts[0].id; promptLoaded = false; selectedPrompt = null; }
+  if (!promptLoaded && !promptBusy) queueMicrotask(() => loadPromptList());
+  const currentDefault = state.assistantDefaults?.[promptAccount];
+  const readonly = !promptNew && !selectedPrompt?.canEdit;
+  const hasEditor = promptNew || selectedPrompt;
+  const status = promptDirty() ? '未保存' : selectedPrompt?.hasDraft || selectedPrompt?.isDraft ? '上游草稿' : '与上游同步';
+  return `<div id="assistant-prompts-page">${heading('助手提示词','读取并编辑 Logicc 上游助手的 systemPrompt。',`<button class="button secondary" data-prompt-action="refresh" ${promptBusy?'disabled':''}>${icon('refresh')}同步列表</button><button class="button primary" data-prompt-action="new" ${promptBusy?'disabled':''}>${icon('plus')}新建助手</button>`,'DEVELOPER / ASSISTANT PROMPTS')}
+  <div class="toolbar"><div class="filter-group"><label class="subtle-text" for="prompt-account">账号</label><select id="prompt-account" ${promptBusy?'disabled':''}>${state.accounts.map(a=>`<option value="${a.id}" ${a.id===promptAccount?'selected':''}>${esc(a.name)}</option>`).join('')}</select><select id="prompt-library" aria-label="助手来源" ${promptBusy?'disabled':''}>${[['library','我的助手库'],['shared','组织共享'],['curated','官方模板']].map(([v,label])=>`<option value="${v}" ${promptType===v?'selected':''}>${label}</option>`).join('')}</select></div></div>
+  <div class="prompt-default"><div>${icon('settings')}<span>代理默认助手：<strong>${esc(currentDefault?.name || '未设置')}</strong></span></div>${currentDefault?`<button class="text-button" data-prompt-action="clear-default" ${promptBusy?'disabled':''}>取消默认</button>`:'<span class="subtle-text">设置后，此账号的新代理请求会使用该助手</span>'}</div>
+  ${promptError?`<div class="form-error" role="alert">${esc(promptError)}</div>`:''}
+  <div class="prompt-grid"><section class="panel prompt-library"><div class="panel-heading"><div><h2>上游助手 <span class="subtle-text">/ ${promptItems.length}</span></h2><p>${promptBusy?'正在同步…':'选择助手查看原文与编辑权限'}</p></div></div><div class="prompt-list">${promptItems.length?promptItems.map(a=>`<button class="prompt-list-item ${selectedPrompt?.id===a.id&&!promptNew?'selected':''}" data-prompt-action="select" data-id="${a.id}" ${promptBusy?'disabled':''}><span class="prompt-list-title">${esc(a.name)}</span><span class="subtle-text">${a.isDraft?'草稿 · ':''}${['owner','editor'].includes(a.permissions)?'可编辑':'只读'}${currentDefault?.id===a.id?' · 代理默认':''}</span></button>`).join(''):`<div class="empty-state">${icon('logs')}<h3>${promptBusy?'正在读取':'此列表暂无助手'}</h3><p>${promptBusy?'稍等片刻':'可新建私有助手，或切换助手来源。'}</p></div>`}</div>${promptCursor?`<div class="table-footer"><button class="text-button" data-prompt-action="more" ${promptBusy?'disabled':''}>加载更多</button></div>`:''}</section>
+  <section class="panel prompt-editor">${hasEditor?`<form id="assistant-prompt-form"><div class="panel-heading"><div><h2>${promptNew?'新建私有助手':esc(selectedPrompt.name)}</h2><p>${promptNew?'创建并发布到当前 Logicc 账号':`来源：Logicc 助手配置 · ${selectedPrompt.canEdit?'有编辑权限':'只读'}`}</p></div><span class="range-label" id="prompt-edit-status">${promptNew?'新建':status}</span></div><div class="prompt-editor-body">
+  ${promptNew?`<div class="prompt-create-fields"><label>助手名称<input id="new-prompt-name" required maxlength="50" value="${esc(newPromptName)}" placeholder="例如：日常开发助手" ${promptBusy?'disabled':''}></label><label>默认模型<select id="new-prompt-model" required ${promptBusy?'disabled':''}>${state.models.length?state.models.map(m=>`<option value="${esc(m.id)}" ${newPromptModel===m.id?'selected':''}>${esc(m.id)}</option>`).join(''):'<option value="">请先在号池中检测账户以同步模型</option>'}</select></label></div>`:`<div class="prompt-metadata"><span class="mono">${esc(selectedPrompt.id)}</span><span>读取于 ${time(selectedPrompt.fetchedAt)}</span></div>`}
+  ${selectedPrompt?.hasDraft&&!promptNew?'<div class="notice">当前显示上游已有草稿。保存并发布会同时发布该草稿中已有的其他改动。</div>':''}
+  <label class="prompt-field-label" for="system-prompt">System prompt</label><textarea id="system-prompt" class="mono" maxlength="30000" spellcheck="false" ${readonly?'readonly':''} ${promptBusy?'disabled':''} placeholder="${selectedPrompt?.promptReadable===false&&!promptNew?'上游没有向当前账号提供提示词原文':'输入这个助手的行为、语气和任务指令…'}">${esc(promptDraft)}</textarea>
+  <div class="prompt-editor-meta"><span>${readonly?'只读：需要 owner 或 editor 权限才能保存':'保存会发布到上游助手，并保留其他配置'}</span><span id="prompt-char-count">${promptDraft.length.toLocaleString()} / 30,000</span></div>
+  <div class="prompt-editor-actions">${!promptNew?`<button type="button" class="button secondary" data-prompt-action="reload" ${promptBusy?'disabled':''}>重新读取</button><button type="button" class="button secondary" data-prompt-action="set-default" ${promptBusy||selectedPrompt.isDraft||selectedPrompt.hasDraft||promptDirty()?'disabled':''}>${currentDefault?.id===selectedPrompt.id?'已设为默认':'设为代理默认助手'}</button>`:''}<button type="submit" class="button primary" id="save-system-prompt" ${promptBusy||readonly||(!promptNew&&!promptDirty())?'disabled':''}>${promptBusy?'处理中…':promptNew?'创建并发布':'保存并发布'}</button></div>
+  ${!promptNew&&selectedPrompt.originalSystemPrompt!==null?`<details class="prompt-backup"><summary>首次读取备份 · ${date(selectedPrompt.firstReadAt)}</summary><pre>${esc(selectedPrompt.originalSystemPrompt || '（空提示词）')}</pre><button type="button" class="text-button" data-prompt-action="restore" ${promptBusy||readonly?'disabled':''}>将备份载入编辑器</button></details>`:''}
+  </div></form>`:empty('选择一个助手','从左侧读取上游提示词，或创建一个属于当前账号的私有助手。','logs')}</section></div><p class="security-caption">编辑对象是上游助手指令，不是 Logicc 平台内置的系统提示词。首次读取备份和默认助手选择单独保存在本机数据卷中。</p></div>`;
+}
+async function loadPromptList(append = false) {
+  if (promptBusy) return;
+  promptBusy = true; promptLoaded = true; promptError = ''; renderPrompts();
+  try {
+    const params = new URLSearchParams({type:promptType});
+    if(append && promptCursor) params.set('cursor',promptCursor);
+    const result=await api(`/accounts/${promptAccount}/assistants?${params}`);
+    promptItems=append?[...promptItems,...result.data.filter(a=>!promptItems.some(old=>old.id===a.id))]:result.data;
+    promptCursor=result.nextCursor;
+    state.assistantDefaults ||= {};state.assistantDefaults[promptAccount]=result.defaultAssistant;
+  } catch(error) { promptError=error.message; }
+  finally { promptBusy=false;renderPrompts(); }
+}
+async function readPrompt(id) {
+  if(promptBusy)return;
+  promptBusy=true;promptError='';renderPrompts();
+  try {const result=await api(`/accounts/${promptAccount}/assistants/${id}`);selectedPrompt=result.assistant;promptDraft=selectedPrompt.systemPrompt || '';promptNew=false;}
+  catch(error){promptError=error.message;}
+  finally{promptBusy=false;renderPrompts();}
+}
+document.addEventListener('input',event=>{
+  if(event.target.id==='new-prompt-name')newPromptName=event.target.value;
+  if(event.target.id==='system-prompt'){
+    promptDraft=event.target.value;
+    $('#prompt-char-count').textContent=`${promptDraft.length.toLocaleString()} / 30,000`;
+    $('#prompt-edit-status').textContent=promptDirty()?'未保存':'与上游同步';
+    $('#save-system-prompt').disabled=promptBusy||(!promptNew&&(!selectedPrompt?.canEdit||!promptDirty()));
+    const setDefault=$('[data-prompt-action="set-default"]');if(setDefault)setDefault.disabled=promptBusy||selectedPrompt.isDraft||selectedPrompt.hasDraft||promptDirty();
+  }
+});
+document.addEventListener('change',event=>{
+  if(event.target.id==='new-prompt-model')newPromptModel=event.target.value;
+  if(!['prompt-account','prompt-library'].includes(event.target.id))return;
+  if(!keepPromptDraft()){renderPrompts();return;}
+  if(event.target.id==='prompt-account')promptAccount=event.target.value;else promptType=event.target.value;
+  selectedPrompt=null;promptNew=false;promptDraft='';promptItems=[];promptCursor=null;loadPromptList();
+});
+document.addEventListener('click',async event=>{
+  const button=event.target.closest('[data-prompt-action]');if(!button||button.disabled||promptBusy)return;
+  const action=button.dataset.promptAction;
+  if(action==='refresh'||action==='more')return loadPromptList(action==='more');
+  if(action==='select'||action==='reload'){if(keepPromptDraft())return readPrompt(action==='select'?button.dataset.id:selectedPrompt.id);return;}
+  if(action==='new'){if(!keepPromptDraft())return;promptNew=true;promptDraft='';newPromptName='';newPromptModel=state.models[0]?.id || '';promptError='';renderPrompts();$('#new-prompt-name')?.focus();return;}
+  if(action==='restore'){promptDraft=selectedPrompt.originalSystemPrompt || '';renderPrompts();$('#system-prompt').focus();return;}
+  if(action==='set-default'||action==='clear-default'){
+    promptBusy=true;promptError='';renderPrompts();
+    try{const result=await api(`/accounts/${promptAccount}/default-assistant`,{method:'PUT',body:{assistantId:action==='clear-default'?null:selectedPrompt.id}});state.assistantDefaults ||= {};state.assistantDefaults[promptAccount]=result.defaultAssistant;toast(result.defaultAssistant?'已设置默认助手，新请求即生效':'已取消默认助手');}
+    catch(error){promptError=error.message;}
+    finally{promptBusy=false;renderPrompts();}
+  }
+});
+document.addEventListener('submit',async event=>{
+  if(event.target.id!=='assistant-prompt-form')return;
+  event.preventDefault();if(promptBusy)return;
+  const creating=promptNew;promptBusy=true;promptError='';renderPrompts();
+  try{
+    const result=await api(`/accounts/${promptAccount}/assistants${creating?'':'/'+selectedPrompt.id}`,{method:creating?'POST':'PUT',body:creating?{name:newPromptName,modelId:newPromptModel,systemPrompt:promptDraft}:{systemPrompt:promptDraft,revision:selectedPrompt.revision}});
+    selectedPrompt=result.assistant;promptDraft=selectedPrompt.systemPrompt || '';promptNew=false;
+    const index=promptItems.findIndex(a=>a.id===selectedPrompt.id);if(index<0)promptItems.unshift(selectedPrompt);else promptItems[index]=selectedPrompt;
+    toast('助手提示词已保存并发布到 Logicc');
+  }catch(error){promptError=error.message;}
+  finally{promptBusy=false;renderPrompts();}
+});
+window.addEventListener('beforeunload',event=>{if(promptDirty()){event.preventDefault();event.returnValue='';}});
+
 function openAccount(id) {
   const form=$('#account-form'); form.reset();
   errorAt('#account-error','');

@@ -11,7 +11,7 @@ import { createAdapter, parseAiSdkStream } from '../server.mjs';
 const jwt = (sid, suffix='initial', exp=Math.floor(Date.now()/1000)+120) => `${Buffer.from('{"alg":"test"}').toString('base64url')}.${Buffer.from(JSON.stringify({sid,exp})).toString('base64url')}.${suffix}`;
 const listen = async server => {server.listen(0,'127.0.0.1');await once(server,'listening');return `http://127.0.0.1:${server.address().port}`;};
 const close = server => new Promise(resolve=>{server.closeAllConnections();server.close(resolve);});
-async function harness(t,extra={},reply) {
+async function harness(t,extra={},reply,assistants) {
   const folder=mkdtempSync(join(tmpdir(),'logicc-test-'));
   const hits=[], tokenCalls=[];
   const mock=createServer(async(req,res)=>{
@@ -20,6 +20,31 @@ async function harness(t,extra={},reply) {
     const body=text?JSON.parse(text):{};
     hits.push({url:req.url,body,sid});
     const respond=(status,data)=>{res.writeHead(status,{'Content-Type':'application/json'});res.end(JSON.stringify(data));};
+    if(assistants && req.url.startsWith('/api/assistants')){
+      const path=req.url.slice('/api/assistants'.length);
+      if(path==='/list'){
+        if(!body.sortType || !body.sortDirection)return respond(400,{});
+        return respond(200,{data:[...assistants.values()].filter(a=>!a.isDraft),hasMore:false});
+      }
+      if(path==='' && req.method==='POST'){
+        const id='draft-'+hits.length, parent=body.parentId?assistants.get(body.parentId):null;
+        if(body.parentId&&!parent)return respond(404,{});
+        assistants.set(id,{...(parent||{name:'',modelId:'test-fast',systemPrompt:'',permissions:'owner',visibility:'private'}),id,isDraft:true,draftId:null,parentId:body.parentId});
+        if(parent)parent.draftId=id;
+        return respond(200,id);
+      }
+      const parts=path.slice(1).split('/'),current=assistants.get(parts[0]);
+      if(!current)return respond(404,{});
+      if(req.method==='GET')return respond(200,current);
+      if(req.method==='PATCH'){if(!current.isDraft)return respond(409,{});Object.assign(current,body);res.writeHead(204);res.end();return;}
+      if(parts[1]==='save' && req.method==='POST'){
+        const target=current.parentId||current.id;
+        assistants.set(target,{...current,id:target,isDraft:false,draftId:null,parentId:null});
+        if(target!==current.id)assistants.delete(current.id);
+        return respond(200,target);
+      }
+      return respond(405,{});
+    }
     if(req.url.includes('/tokens')){
       tokenCalls.push(req.headers.cookie);
       const session=req.url.split('/')[4];
@@ -306,4 +331,75 @@ test('Responses custom tools preserve free-form input and round-trip custom_tool
   assert.equal(call.type,'custom_tool_call');assert.ok(call.input.startsWith('*** Begin Patch'));
   const second=await api('/v1/responses','POST',{previous_response_id:first.id,input:[{type:'custom_tool_call_output',call_id:call.call_id,output:'Applied'}],tools});
   assert.equal(second.status,200);assert.equal(second.data.output[0].content[0].text,'Done');
+});
+
+function assistantFixtures() {
+  return new Map([
+    ['owned-assistant',{id:'owned-assistant',name:'Owned assistant',modelId:'test-slow',systemPrompt:'ORIGINAL_UPSTREAM_PROMPT',description:'Keep this description',features:{'web-search':true,'image-generation':false},conversationStarters:['Hello'],permissions:'owner',visibility:'private',isDraft:false}],
+    ['readonly-assistant',{id:'readonly-assistant',name:'Shared assistant',modelId:'test-fast',systemPrompt:'READ_ONLY_PROMPT',permissions:'viewer',visibility:'shared',isDraft:false}],
+  ]);
+}
+
+test('assistant prompts are read from upstream, backed up separately, and saved through draft + publish',async t=>{
+  const fixtures=assistantFixtures();const {api,add,file,hits}=await harness(t,{},undefined,fixtures);const account=await add('prompt account','sess_prompt');
+  const base=`/api/accounts/${account.id}/assistants`;
+  assert.equal((await api(base)).data.data.length,2);
+  const first=(await api(base+'/owned-assistant')).data.assistant;
+  assert.equal(first.systemPrompt,'ORIGINAL_UPSTREAM_PROMPT');assert.equal(first.canEdit,true);
+  const saved=await api(base+'/owned-assistant','PUT',{systemPrompt:'UPDATED_UPSTREAM_PROMPT',revision:first.revision});
+  assert.equal(saved.status,200);assert.equal(saved.data.assistant.systemPrompt,'UPDATED_UPSTREAM_PROMPT');
+  assert.equal(saved.data.assistant.originalSystemPrompt,'ORIGINAL_UPSTREAM_PROMPT');
+  assert.ok(hits.some(h=>h.url==='/api/assistants'&&h.body.parentId==='owned-assistant'));
+  assert.deepEqual(hits.find(h=>h.url.startsWith('/api/assistants/draft-')&&h.body.systemPrompt).body,{systemPrompt:'UPDATED_UPSTREAM_PROMPT'});
+  assert.ok(hits.some(h=>h.url.endsWith('/save')));
+  assert.equal(fixtures.get('owned-assistant').description,'Keep this description');
+  assert.equal(fixtures.get('owned-assistant').features['web-search'],true);
+  const snapshotFile=join(file,'..','assistant-prompts.json');
+  assert.equal(statSync(snapshotFile).mode & 0o777,0o600);
+  const snapshots=JSON.parse(readFileSync(snapshotFile));assert.equal(snapshots.snapshots[0].originalSystemPrompt,'ORIGINAL_UPSTREAM_PROMPT');
+  assert.ok(!readFileSync(file,'utf8').includes('UPDATED_UPSTREAM_PROMPT'));
+  assert.ok(!JSON.stringify((await api('/api/state')).data).includes('UPDATED_UPSTREAM_PROMPT'));
+});
+
+test('assistant permission checks and revision conflicts prevent unintended upstream writes',async t=>{
+  const fixtures=assistantFixtures();const {api,add,hits}=await harness(t,{},undefined,fixtures);const account=await add('prompt permission','sess_prompt_permission');
+  const base=`/api/accounts/${account.id}/assistants`;
+  const readonly=(await api(base+'/readonly-assistant')).data.assistant;assert.equal(readonly.canEdit,false);
+  assert.equal((await api(base+'/readonly-assistant','PUT',{systemPrompt:'Bad write',revision:readonly.revision})).status,403);
+  const first=(await api(base+'/owned-assistant')).data.assistant;
+  fixtures.get('owned-assistant').systemPrompt='Changed by another editor';
+  assert.equal((await api(base+'/owned-assistant','PUT',{systemPrompt:'Stale overwrite',revision:first.revision})).status,409);
+  assert.ok(!hits.some(h=>h.url==='/api/assistants'));
+  assert.equal((await api(base+'/owned-assistant','PUT',{systemPrompt:'x'.repeat(30001),revision:first.revision})).status,400);
+  const state=(await api('/api/state')).data;assert.equal(state.stats.active,0);assert.notEqual(state.accounts[0].status,'cooling');
+});
+
+test('new assistant publication and default selection affect all three proxy protocols',async t=>{
+  const fixtures=assistantFixtures();const {api,add,hits,file}=await harness(t,{},undefined,fixtures);const account=await add('default assistant','sess_default_assistant');
+  const created=await api(`/api/accounts/${account.id}/assistants`,'POST',{name:'New assistant',modelId:'test-slow',systemPrompt:'PRIVATE_ASSISTANT_PROMPT'});
+  assert.equal(created.status,201);assert.equal(created.data.assistant.isDraft,false);
+  const selected=created.data.assistant.id;
+  assert.equal((await api(`/api/accounts/${account.id}/default-assistant`,'PUT',{assistantId:selected})).data.defaultAssistant.id,selected);
+  for(const [path,body] of [['chat/completions',{messages:[{role:'user',content:'Hello'}]}],['responses',{input:'Hello'}],['messages',{messages:[{role:'user',content:'Hello'}],max_tokens:32}]]){
+    const response=await api('/v1/'+path,'POST',body);assert.equal(response.status,200);assert.equal(response.data.model,'test-slow');
+    assert.deepEqual(hits.filter(h=>h.url==='/api/chats').at(-1).body,{assistantId:selected});
+  }
+  const snapshotFile=join(file,'..','assistant-prompts.json');
+  assert.equal(JSON.parse(readFileSync(snapshotFile)).defaults[account.id].id,selected);
+  await api(`/api/accounts/${account.id}/default-assistant`,'PUT',{assistantId:null});
+  await api('/v1/chat/completions','POST',{model:'test-fast',messages:[{role:'user',content:'Hello'}]});
+  assert.deepEqual(hits.filter(h=>h.url==='/api/chats').at(-1).body,{});
+});
+
+test('existing assistant drafts are reused and snapshots survive reloading the service',async t=>{
+  const fixtures=assistantFixtures();fixtures.get('owned-assistant').draftId='existing-draft';fixtures.set('existing-draft',{...fixtures.get('owned-assistant'),id:'existing-draft',parentId:'owned-assistant',isDraft:true,draftId:null,systemPrompt:'Existing draft text'});
+  const {api,add,hits,file}=await harness(t,{},undefined,fixtures);const account=await add('drafts','sess_drafts');const base=`/api/accounts/${account.id}/assistants/owned-assistant`;
+  const first=(await api(base)).data.assistant;assert.equal(first.hasDraft,true);assert.equal(first.systemPrompt,'Existing draft text');assert.equal(first.originalSystemPrompt,'ORIGINAL_UPSTREAM_PROMPT');
+  const saved=await api(base,'PUT',{systemPrompt:'Final draft',revision:first.revision});assert.equal(saved.status,200);
+  assert.ok(!hits.some(h=>h.url==='/api/assistants'));
+  const {AssistantPrompts}=await import('../assistants.mjs');
+  const cache=new AssistantPrompts(join(file,'..','assistant-prompts.json'),()=>{throw new Error('should not call upstream');});
+  assert.equal(cache.data.snapshots[0].systemPrompt,'Final draft');assert.equal(cache.data.snapshots[0].originalSystemPrompt,'ORIGINAL_UPSTREAM_PROMPT');
+  await api(`/api/accounts/${account.id}`,'DELETE');
+  assert.equal(JSON.parse(readFileSync(join(file,'..','assistant-prompts.json'))).snapshots.length,0);
 });
