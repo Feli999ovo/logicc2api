@@ -293,6 +293,10 @@ The default `store: true` temporarily retains responses and conversation history
 
 `POST /v1/messages` supports `system`, text content blocks, `tools[].input_schema`, `tool_choice`, `tool_use`, and `tool_result`. If a proxy API key is configured, use either `x-api-key` or Bearer authentication.
 
+For clients that mix request formats, this adapter also accepts `system` / `developer` roles inside `messages`, Chat-style `assistant.tool_calls`, and `role: tool` with `tool_call_id`. Top-level `system` and inline instructions are both retained, with their roles and relative order preserved. Nested `tools[].function` definitions and `tool_choice: {type: "function", function: {name: "..."}}` are supported too. Responses still use the Messages JSON/SSE format, including `tool_use` blocks; `/v1/messages/count_tokens` accepts the same inputs.
+
+Tool results must reference an earlier assistant call (`tool_use` or `tool_calls`) by ID. Missing calls, missing IDs, or duplicate results still return HTTP 400 with a specific validation error; the adapter does not invent missing tool history.
+
 ```bash
 curl http://127.0.0.1:18789/v1/messages \
   -H 'Content-Type: application/json' \

@@ -293,6 +293,10 @@ curl http://127.0.0.1:18789/v1/responses \
 
 `POST /v1/messages` 支持 `system`、文本内容块、`tools[].input_schema`、`tool_choice`、`tool_use` 和 `tool_result`。配置了代理 API Key 时，可使用 `x-api-key` 或 Bearer 认证。
 
+为兼容混合协议客户端，代理也接受 `messages` 内的 `system` / `developer` 角色、Chat 格式的 `assistant.tool_calls`，以及带 `tool_call_id` 的 `role: tool`。顶层 `system` 和消息中的指令会同时保留，角色与相对顺序不变；同时支持嵌套的 `tools[].function` 定义及 `tool_choice: {type: "function", function: {name: "..."}}`。响应继续使用 Messages 的 JSON/SSE 格式，包括 `tool_use` 内容块；`/v1/messages/count_tokens` 接受同样的输入。
+
+工具结果仍须通过 ID 对应前面的 assistant 调用（`tool_use` 或 `tool_calls`）。缺少历史调用、缺少 ID 或重复提交结果时，仍返回 HTTP 400 和具体校验原因；代理不会补造工具历史。
+
 ```bash
 curl http://127.0.0.1:18789/v1/messages \
   -H 'Content-Type: application/json' \

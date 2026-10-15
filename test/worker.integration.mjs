@@ -29,7 +29,7 @@ test('Worker auth, real workerd routing, protocols, storage, and isolation', { t
     if (req.url === '/api/chats') return json('test-chat');
     if (req.url === '/api/chats/test-chat') {
       res.writeHead(200, { 'Content-Type': 'text/event-stream' });
-      const answer = body.prompt.includes('worker_test_tool') ? JSON.stringify({ tool_calls: [{ name: 'worker_test_tool', arguments: { value: 1 } }] }) : 'hello from mock';
+      const answer = body.prompt.includes('worker_test_tool') && !body.prompt.includes('"role":"tool"') ? JSON.stringify({ tool_calls: [{ name: 'worker_test_tool', arguments: { value: 1 } }] }) : 'hello from mock';
       for (const event of [{ type: 'text-delta', delta: answer }, { type: 'finish', usage: { inputTokens: 1, outputTokens: 3 } }]) res.write(`data: ${JSON.stringify(event)}\n\n`);
       return res.end('data: [DONE]\n\n');
     }
@@ -102,6 +102,27 @@ test('Worker auth, real workerd routing, protocols, storage, and isolation', { t
     assert.equal(tools.status, 200); assert.equal(tools.data.choices[0].message.tool_calls[0].function.name, 'worker_test_tool');
     const counted = await jsonRequest('/v1/messages/count_tokens', 'POST', { model: 'test-model', messages: [{ role: 'user', content: 'hello' }] }, { 'x-api-key': apiKey });
     assert.equal(counted.status, 200);
+  });
+  await check('Messages accepts mixed roles and Chat-style tool history in Workers', async () => {
+    const body = { model: 'test-model', system: 'TOP_SYSTEM', messages: [
+      { role: 'system', content: 'INLINE_SYSTEM' }, { role: 'developer', content: 'DEVELOPER_RULE' }, { role: 'user', content: 'hello' },
+    ], tools: [{ type: 'function', function: { name: 'worker_test_tool', parameters: { type: 'object', properties: { value: { type: 'integer' } } } } }], tool_choice: { type: 'function', function: { name: 'worker_test_tool' } } };
+    const first = await jsonRequest('/v1/messages', 'POST', body, apiAuth);
+    assert.equal(first.status, 200); assert.equal(first.data.stop_reason, 'tool_use');
+    const call = first.data.content[0];
+    assert.equal(call.type, 'tool_use'); assert.equal(call.name, 'worker_test_tool');
+    assert.ok(hits.at(-1).body.prompt.includes('DEVELOPER_RULE'));
+    const next = { ...body, tool_choice: 'auto', messages: [...body.messages,
+      { role: 'assistant', content: null, tool_calls: [{ id: call.id, type: 'function', function: { name: call.name, arguments: JSON.stringify(call.input) } }] },
+      { role: 'tool', tool_call_id: call.id, content: '1' },
+    ] };
+    for (const stream of [false, true]) {
+      const response = await request('/v1/messages', 'POST', { ...next, stream }, apiAuth);
+      assert.equal(response.status, 200);
+      const text = await response.text(); assert.ok(text.includes('hello from mock'));
+      if (stream) assert.ok(text.includes('message_stop')); else assert.equal(JSON.parse(text).stop_reason, 'end_turn');
+    }
+    assert.equal((await jsonRequest('/v1/messages/count_tokens', 'POST', next, { 'x-api-key': apiKey })).status, 200);
   });
   await check('account and assistant data are written to durable storage', async () => {
     assert.equal((await jsonRequest(`/api/accounts/${id}/assistants/test-assistant`)).status, 200);

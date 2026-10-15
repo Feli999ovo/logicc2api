@@ -63,10 +63,16 @@ function fromMessages(body) {
   const result = [];
   if (body.system !== undefined) result.push({ role: 'system', content: textContent(body.system) });
   for (const message of body.messages) {
-    if (!object(message) || !['user', 'assistant'].includes(message.role)) invalid('Messages role 仅支持 user / assistant');
-    const parts = typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content;
+    if (!object(message)) invalid('消息必须为 JSON 对象');
+    // Some clients send Chat roles/calls to /v1/messages. Normalize them without losing native content blocks.
+    const normalized = fromChat([{ ...message, content: '' }])[0];
+    if (['system', 'developer', 'tool'].includes(message.role)) {
+      result.push({ ...normalized, content: textContent(message.content) });
+      continue;
+    }
+    const parts = message.content == null && normalized.tool_calls?.length ? [] : typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content;
     if (!Array.isArray(parts)) invalid('Messages content 必须为文本或数组');
-    let pending = { role: message.role, content: '' };
+    let pending = normalized;
     const flush = () => { if (pending.content || pending.tool_calls?.length) result.push(pending); pending = { role: message.role, content: '' }; };
     for (const part of parts) {
       if (part?.type === 'tool_use') {
@@ -93,7 +99,7 @@ function normalizeTools(body, protocol) {
     if (Object.hasOwn(builtinTypes, tool.type)) { builtins.push({ type: tool.type, upstream: builtinTypes[tool.type] }); continue; }
     let fn, kind = 'function';
     if (protocol === 'messages' && (!tool.type || tool.type === 'custom')) fn = { ...tool, parameters: tool.input_schema };
-    else if (tool.type === 'function') fn = protocol === 'chat' ? tool.function : tool;
+    else if (tool.type === 'function') fn = protocol === 'chat' ? tool.function : protocol === 'messages' ? tool.function ?? tool : tool;
     else if (protocol === 'responses' && tool.type === 'custom') { fn = tool; kind = 'custom'; }
     else invalid(`不支持的工具类型：${tool.type || 'unknown'}`);
     if (!object(fn) || typeof fn.name !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(fn.name)) invalid('工具名称格式不正确');
@@ -104,7 +110,7 @@ function normalizeTools(body, protocol) {
   }
   let choice = body.tool_choice ?? 'auto';
   if (object(choice)) {
-    if (protocol === 'messages') choice = choice.type === 'tool' ? choice.name : choice.type === 'any' ? 'required' : choice.type;
+    if (protocol === 'messages') choice = choice.type === 'tool' ? choice.name : choice.type === 'function' ? choice.function?.name || choice.name : choice.type === 'any' ? 'required' : choice.type;
     else choice = choice.type === 'function' ? choice.function?.name || choice.name : choice.type === 'custom' ? choice.name : choice.type;
   }
   if (typeof choice !== 'string' || !['auto', 'none', 'required', ...tools.map(t => t.name), ...builtins.map(t => t.type)].includes(choice)) invalid('tool_choice 不正确或引用了未定义的工具');

@@ -294,6 +294,78 @@ test('Messages SSE provides complete tool input and stops with tool_use, not tex
   assert.equal(frames[4].data.delta.stop_reason,'tool_use');assert.equal(frames[4].data.usage.output_tokens,8);assert.ok(!text.includes('[DONE]'));
 });
 
+test('Messages accepts inline system/developer instructions without changing their order or role', async t => {
+  const { api, base, add, hits } = await harness(t, {}, () => textEvents('Instructions received'));
+  await add('mixed roles', 'sess_mixedroles');
+  const body = { model: 'test-fast', system: [{ type: 'text', text: 'TOP_SYSTEM' }], messages: [
+    { role: 'system', content: 'INLINE_SYSTEM' },
+    { role: 'developer', content: [{ type: 'text', text: 'INLINE_DEVELOPER' }] },
+    { role: 'user', content: 'hello' },
+    { role: 'system', content: [{ type: 'text', text: 'LATER_SYSTEM' }] },
+    { role: 'user', content: 'continue' },
+  ] };
+  const result = await api('/v1/messages', 'POST', body);
+  assert.equal(result.status, 200); assert.equal(result.data.type, 'message');
+  assert.equal(hits.at(-1).body.prompt, '[system]\nTOP_SYSTEM\n\n[system]\nINLINE_SYSTEM\n\n[developer]\nINLINE_DEVELOPER\n\nhello\n\n[system]\nLATER_SYSTEM\n\ncontinue');
+  const hitCount = hits.length;
+  assert.equal((await api('/v1/messages/count_tokens', 'POST', body)).status, 200);
+  assert.equal(hits.length, hitCount);
+  const stream = await fetch(base + '/v1/messages', { method: 'POST', body: JSON.stringify({ ...body, stream: true }) });
+  assert.equal(stream.status, 200);
+  const frames = sseFrames(await stream.text());
+  assert.equal(frames[0].event, 'message_start'); assert.equal(frames.at(-1).event, 'message_stop');
+  assert.ok(frames.some(frame => frame.data.delta?.text));
+});
+
+test('Messages handles Chat-style tools and mixed tool history with native Messages responses', async t => {
+  const { api, add, hits } = await harness(t, {}, toolReply); await add('mixed tools', 'sess_mixedtools');
+  const body = { model: 'test-fast', system: 'TOP_SYSTEM', messages: [
+    { role: 'developer', content: 'DEVELOPER_INSTRUCTION' }, { role: 'user', content: 'Weather in Hangzhou' },
+  ], tools: chatTools, tool_choice: { type: 'function', function: { name: 'get_weather' } } };
+  const first = await api('/v1/messages', 'POST', body);
+  assert.equal(first.status, 200); assert.equal(first.data.stop_reason, 'tool_use');
+  const call = first.data.content[0]; assert.equal(call.type, 'tool_use'); assert.equal(call.name, 'get_weather');
+  const chatCall = { id: call.id, type: 'function', function: { name: call.name, arguments: JSON.stringify(call.input) } };
+  for (const [assistant, result] of [
+    [{ role: 'assistant', content: null, tool_calls: [chatCall] }, { role: 'tool', tool_call_id: call.id, content: '21 C' }],
+    [{ role: 'assistant', content: [call] }, { role: 'tool', tool_call_id: call.id, content: [{ type: 'text', text: '21 C' }] }],
+    [{ role: 'assistant', tool_calls: [chatCall] }, { role: 'user', content: [{ type: 'tool_result', tool_use_id: call.id, content: '21 C' }] }],
+  ]) {
+    const continued = { ...body, tools: messageTools, tool_choice: { type: 'auto' }, messages: [...body.messages, assistant, result] };
+    const response = await api('/v1/messages', 'POST', continued);
+    assert.equal(response.status, 200); assert.equal(response.data.stop_reason, 'end_turn');
+    assert.equal(response.data.content[0].text, 'Hangzhou: 21 C');
+    const prompt = hits.at(-1).body.prompt;
+    assert.ok(prompt.includes('TOP_SYSTEM')); assert.ok(prompt.includes('DEVELOPER_INSTRUCTION'));
+    assert.ok(prompt.includes(call.id)); assert.ok(prompt.includes('21 C'));
+    assert.equal((await api('/v1/messages/count_tokens', 'POST', continued)).status, 200);
+  }
+});
+
+test('Messages mixed-role compatibility still rejects malformed and unmatched tool history before upstream', async t => {
+  const { api, hits } = await harness(t);
+  const call = { role: 'assistant', content: null, tool_calls: [{ id: 'call_test', type: 'function', function: { name: 'get_weather', arguments: '{}' } }] };
+  const result = { role: 'tool', tool_call_id: 'call_test', content: '21 C' };
+  for (const messages of [
+    [result],
+    [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_test', content: '21 C' }] }],
+    [call, { ...result, tool_call_id: 'missing' }],
+    [call, result, result],
+    [call, call, result],
+    [{ role: 'tool', content: 'missing ID' }],
+    [{ role: 'user', content: 'hello', tool_calls: call.tool_calls }],
+    [{ role: 'assistant', content: null, tool_calls: [{ ...call.tool_calls[0], function: { name: 'get_weather', arguments: '{broken' } }] }],
+    [{ role: 'unknown', content: 'hello' }],
+  ]) {
+    for (const path of ['/v1/messages', '/v1/messages/count_tokens']) {
+      const response = await api(path, 'POST', { model: 'test-fast', messages });
+      assert.equal(response.status, 400); assert.equal(response.data.type, 'error');
+      assert.equal(response.data.error.type, 'invalid_request_error');
+    }
+  }
+  assert.equal(hits.length, 0);
+});
+
 test('new protocols keep ordinary text streaming and emit their own terminal error events',async t=>{
   for(const protocol of ['responses','messages'])await t.test(protocol,async t=>{
     const {api,base,add,pool}=await harness(t,{},body=>body.prompt.includes('FAIL_STREAM')?[{type:'error',errorText:'deliberate failure'}]:textEvents('Hello world'));
