@@ -181,6 +181,21 @@ ssh -N -L 18789:127.0.0.1:18789 your-user@your-server
 
 Then open `http://127.0.0.1:18789/` on your computer. Adjust both port numbers if you configured another port. The existing local-origin checks remain in effect; public-domain hosting requires a separate authentication/access design.
 
+### Troubleshoot `fetch failed` / DNS errors in Docker
+
+If requests fail while the container remains healthy, check the request log. Network failures include the upstream hostname and a known error code: `EAI_AGAIN` / `ENOTFOUND` indicates DNS resolution failed. A successful `/health` check only confirms the local service is running.
+
+Docker Desktop's DNS forwarder may time out on IPv6 (AAAA) queries even when the host resolves the domain. After verifying that another DNS server works from the container, create a **local** `compose.override.yaml` using that resolver. For example, if `223.5.5.5` works in your environment:
+
+```yaml
+services:
+  logicc2api:
+    dns:
+      - 223.5.5.5
+```
+
+Run `docker compose up -d --wait` to apply it. Compose loads the override automatically and retains the data volume. This file is ignored by Git; other deployments keep their own DNS settings. DNS failures alone do not establish that your Logicc credentials are invalid. See [Docker's DNS configuration guidance](https://docs.docker.com/desktop/features/networking/networking-how-tos/).
+
 ## Account credentials
 
 The account form accepts any of the following:

@@ -20,6 +20,27 @@ export function safeError(error) {
   return String(error?.message || error).replace(/eyJ[\w-]+\.[\w-]+\.[\w-]+/g, '[凭据已隐藏]').slice(0, 350);
 }
 
+export async function upstreamFetch(url, options) {
+  try { return await fetch(url, options); }
+  catch (error) {
+    if (options?.signal?.aborted) throw error;
+    const reasons = {
+      EAI_AGAIN: 'DNS 暂时解析失败，请检查容器或宿主机 DNS',
+      ENOTFOUND: 'DNS 找不到上游域名，请检查 DNS 和上游地址',
+      ECONNREFUSED: '连接被拒绝，请检查网络或代理设置',
+      ECONNRESET: '连接被中断，请检查网络或代理设置',
+      ETIMEDOUT: '连接超时，请检查网络或代理设置',
+      UND_ERR_CONNECT_TIMEOUT: '连接超时，请检查网络或代理设置',
+      CERT_HAS_EXPIRED: 'TLS 证书已过期，请检查证书和系统时间',
+      UNABLE_TO_VERIFY_LEAF_SIGNATURE: 'TLS 证书无法验证，请检查代理证书配置',
+      DEPTH_ZERO_SELF_SIGNED_CERT: 'TLS 证书不受信任，请检查代理证书配置',
+    };
+    const code = [error?.cause?.code, error?.code, ...(error?.cause?.errors || []).map(e => e?.code)].find(code => Object.hasOwn(reasons, code));
+    // Only include known network codes and the hostname; never log URLs, headers, or credential-bearing causes.
+    throw new HttpError(502, `${new URL(url).hostname}：${code ? `${reasons[code]}（${code}）` : '上游网络连接失败，请检查网络或代理设置'}`);
+  }
+}
+
 // Clear completed request deadlines so idle Durable Objects can be evicted.
 export function deadline(milliseconds) {
   const controller = new AbortController();
@@ -229,7 +250,7 @@ export class AccountPool {
     const base = (this.env.LOGICC_CLERK_BASE || 'https://clerk.logicc.com').replace(/\/+$/, '');
     const timeout = deadline(20000);
     try {
-      const response = await fetch(`${base}/v1/client/sessions/${encodeURIComponent(account.sessionId)}/tokens`, {
+      const response = await upstreamFetch(`${base}/v1/client/sessions/${encodeURIComponent(account.sessionId)}/tokens`, {
         method: 'POST', headers: { Cookie: `__client=${account.clientCookie}`, Origin: 'https://app.logicc.com' },
         signal: timeout.signal, redirect: 'manual',
       });

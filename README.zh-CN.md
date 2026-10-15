@@ -181,6 +181,21 @@ ssh -N -L 18789:127.0.0.1:18789 your-user@your-server
 
 然后在电脑上打开 `http://127.0.0.1:18789/`。如果修改了端口，请同步调整两处端口号。现有本机来源检查仍然生效；公网域名访问需要另行设计身份认证和访问控制。
 
+### Docker 请求报 `fetch failed` / DNS 错误
+
+容器显示 healthy 但请求失败时，先查看请求日志。网络错误会显示上游域名及已识别的错误代码；`EAI_AGAIN` / `ENOTFOUND` 表示域名解析失败。`/health` 成功只代表本地服务正在运行。
+
+Docker Desktop 的 DNS 转发器可能在 IPv6（AAAA）查询上超时，而宿主机仍能正常解析。确认另一个 DNS 在容器中可用后，可创建**本机配置** `compose.override.yaml`，指定该 DNS。例如已验证 `223.5.5.5` 可用时：
+
+```yaml
+services:
+  logicc2api:
+    dns:
+      - 223.5.5.5
+```
+
+执行 `docker compose up -d --wait` 应用配置。Compose 会自动加载此文件并保留原有数据卷。该文件已被 Git 忽略，其他部署继续使用自己的 DNS。仅凭 DNS 错误不能判断 Logicc 凭据失效。可参考 [Docker DNS 配置说明](https://docs.docker.com/desktop/features/networking/networking-how-tos/)。
+
 ## 账户凭据
 
 添加账户时支持以下任一种组合：

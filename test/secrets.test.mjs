@@ -8,7 +8,7 @@ test('credential guard reports locations without revealing values; local credent
   assert.deepEqual(findSecrets('example\n' + token), [{ kind: 'JWT', line: 2 }]);
   assert.ok(!JSON.stringify(findSecrets(token)).includes(token));
   assert.deepEqual(findSecrets('LOGICC_API_KEY=""\nSession JWT: YOUR_SESSION_JWT'), []);
-  const files = ['data/state.json', '.env', '.env.production', '.dev.vars', '.dev.vars.production', '.wrangler/state/db.sqlite', 'accounts.json', 'credentials.json', 'logicc-token.txt', 'logicc-cookies.txt', 'capture.har', 'capture.pcap', 'tls.keys'];
+  const files = ['data/state.json', '.env', '.env.production', '.dev.vars', '.dev.vars.production', '.wrangler/state/db.sqlite', 'accounts.json', 'credentials.json', 'logicc-token.txt', 'logicc-cookies.txt', 'capture.har', 'capture.pcap', 'tls.keys', 'compose.override.yaml'];
   const ignored = execFileSync('git', ['check-ignore', '--no-index', '--stdin'], { input: files.join('\n') + '\n', encoding: 'utf8' }).trim().split('\n');
   assert.deepEqual(ignored, files);
 });

@@ -9,6 +9,9 @@ node_modules/
 !.dev.vars.example
 .wrangler/
 dist/
+# Machine-specific Docker settings, including local DNS/proxy overrides.
+compose.override.yaml
+compose.override.yml
 .DS_Store
 assistant-prompts.json
 assistant-prompts.json.tmp

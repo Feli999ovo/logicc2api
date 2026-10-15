@@ -5,12 +5,32 @@ import { once } from 'node:events';
 import { mkdtempSync, readFileSync, statSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AccountPool, claims } from '../pool.mjs';
+import { AccountPool, claims, upstreamFetch } from '../pool.mjs';
 import { createAdapter, parseAiSdkStream } from '../server.mjs';
 
 const jwt = (sid, suffix='initial', exp=Math.floor(Date.now()/1000)+120) => `${Buffer.from('{"alg":"test"}').toString('base64url')}.${Buffer.from(JSON.stringify({sid,exp})).toString('base64url')}.${suffix}`;
 const listen = async server => {server.listen(0,'127.0.0.1');await once(server,'listening');return `http://127.0.0.1:${server.address().port}`;};
 const close = server => new Promise(resolve=>{server.closeAllConnections();server.close(resolve);});
+
+test('upstream network failures explain DNS/connection errors without exposing credentials', async t => {
+  let failure;
+  t.mock.method(globalThis, 'fetch', async () => { throw failure; });
+  for (const code of ['EAI_AGAIN', 'ENOTFOUND', 'ECONNRESET', 'UND_ERR_CONNECT_TIMEOUT', 'CERT_HAS_EXPIRED']) {
+    failure = new TypeError('fetch failed', { cause: Object.assign(new Error('sensitive-cookie-value'), { code }) });
+    await assert.rejects(upstreamFetch('https://clerk.logicc.com/private-session?token=sensitive-cookie-value', {}), error => {
+      assert.equal(error.status, 502); assert.ok(error.message.includes('clerk.logicc.com'));
+      assert.ok(error.message.includes(code)); assert.ok(!error.message.includes('sensitive-cookie-value'));
+      assert.ok(!error.message.includes('private-session')); return true;
+    });
+  }
+  failure = new TypeError('fetch failed', { cause: new AggregateError([Object.assign(new Error('hidden'), { code: 'ETIMEDOUT' })]) });
+  await assert.rejects(upstreamFetch('https://app.logicc.com/api/models', {}), /ETIMEDOUT/);
+  failure = new Error('sensitive-cookie-value');
+  await assert.rejects(upstreamFetch('https://app.logicc.com/api/models', {}), /上游网络连接失败/);
+  const signal = AbortSignal.abort();
+  await assert.rejects(upstreamFetch('https://app.logicc.com/api/models', { signal }), error => error === failure);
+});
+
 async function harness(t,extra={},reply,assistants) {
   const folder=mkdtempSync(join(tmpdir(),'logicc-test-'));
   const hits=[], tokenCalls=[];

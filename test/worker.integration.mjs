@@ -17,7 +17,7 @@ test('Worker auth, real workerd routing, protocols, storage, and isolation', { t
   const mock = createServer(async (req, res) => {
     let text = ''; for await (const chunk of req) text += chunk;
     const body = text ? JSON.parse(text) : {};
-    hits.push({ path: req.url, body, cookie: req.headers.cookie });
+    hits.push({ path: req.url, body, cookie: req.headers.cookie, hasAuthorization: Boolean(req.headers.authorization) });
     const json = data => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(data)); };
     if (req.url.includes('/tokens')) {
       res.setHeader('Set-Cookie', '__client=rotated_worker_test_cookie; HttpOnly; Path=/');
@@ -65,7 +65,9 @@ test('Worker auth, real workerd routing, protocols, storage, and isolation', { t
     assert.equal((await request('/api/state', 'GET', undefined, { ...auth, 'Sec-Fetch-Site': 'cross-site' })).status, 403);
     assert.equal((await request('/__set_token', 'POST', {})).status, 404);
     assert.equal((await request('/health', 'GET', undefined, {})).status, 200);
-    assert.equal(hits.length, 0, JSON.stringify(hits.map(h => h.path)));
+    // Ignore only credential-free root probes observed during local runtime startup.
+    const upstreamHits = hits.filter(h => h.path !== '/' || h.cookie || h.hasAuthorization);
+    assert.equal(upstreamHits.length, 0, JSON.stringify(upstreamHits.map(h => h.path)));
   });
   await check('authenticated console assets and public Base URL work', async () => {
     const page = await request('/'); assert.equal(page.status, 200); assert.match(await page.text(), /<html/);

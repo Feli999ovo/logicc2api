@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
-import { AccountPool, HttpError, claims, safeError, deadline } from './pool.mjs';
+import { AccountPool, HttpError, claims, safeError, deadline, upstreamFetch } from './pool.mjs';
 import { normalizeRequest, buildPrompt, parseToolOutput, ProtocolOutput, errorPayload } from './protocols.mjs';
 import { AssistantPrompts } from './assistants.mjs';
 
@@ -71,7 +71,7 @@ export function createAdapter({ env = process.env, dataFile = env.LOGICC_DATA_FI
 
   async function upstream(account, path, { method = 'GET', body, stream = false, signal } = {}, retry = true) {
     const token = await pool.tokenFor(account);
-    const response = await fetch(`${apiBase}/${path}`, {
+    const response = await upstreamFetch(`${apiBase}/${path}`, {
       method, signal, redirect: 'manual',
       headers: { Authorization: `Bearer ${token}`, Accept: stream ? 'text/event-stream' : 'application/json',
         ...(stream ? { 'Stream-Response-Protocol': 'ai-sdk-v6' } : {}),
