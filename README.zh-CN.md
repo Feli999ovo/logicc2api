@@ -4,6 +4,8 @@
 
 [![一键部署到 Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/JamesZhaoY/logicc2api)
 
+此按钮会新建 Git 仓库。你的 Git 账户中已有本项目时，请使用[从已有仓库部署](#从已有仓库部署)。
+
 > **免责声明：** 使用前请阅读[《免责声明与使用责任说明》](DISCLAIMER.md)，了解账户授权、第三方服务风险、数据处理及责任限制。软件许可继续适用 [MIT License](LICENSE)。
 
 为 [Logicc](https://app.logicc.com) 提供 OpenAI 兼容接口的代理，内置号池管理和 Web 控制台，支持 Node.js、Docker 和 Cloudflare Workers 部署。将 Logicc 的 AI SDK v6 数据流转换成 OpenAI Chat Completions / Responses 和 Anthropic Messages 响应，集中查看账户状态、流量、模型延迟和请求日志。
@@ -54,6 +56,17 @@ node server.mjs 18790
 
 ## Cloudflare Workers 一键部署
 
+请根据自己的情况选择入口：
+
+| 使用场景 | 部署入口 | Git 仓库的处理方式 |
+| --- | --- | --- |
+| 第一次把项目安装到自己的 Git 账户 | **Deploy to Cloudflare** 按钮 | 创建一份新的仓库副本 |
+| 已经拥有或 Fork 了 `logicc2api` | Cloudflare **Workers & Pages → 创建应用 → 导入仓库** | 连接已有仓库 |
+
+按钮页面提示 **“已存在具有该名称的存储库”**，指的是 GitHub/GitLab 仓库重名：模板流程正在尝试创建另一个同名仓库。已有项目应使用下方的导入流程直接部署。
+
+### 首次安装：使用一键部署按钮
+
 点击文档顶部的 **Deploy to Cloudflare** 按钮。[官方部署流程](https://developers.cloudflare.com/workers/platform/deploy-buttons/)会把公开仓库复制到你的 GitHub/GitLab 账户，构建 Worker 并自动创建 Durable Object 存储绑定，无需预先准备服务器或数据库。
 
 1. 登录 Cloudflare，连接 Git 账户，设置仓库和 Worker 名称。
@@ -68,6 +81,27 @@ node server.mjs 18790
 4. 部署完成后，打开 `https://<worker>.<subdomain>.workers.dev/`，在浏览器登录框中输入管理员用户名和密码。
 5. 进入 **号池管理 → 添加账户**，填写**你自己的 Logicc 凭据**。账号在部署后添加，仓库和部署按钮不会附带作者的账号。
 6. OpenAI 客户端 Base URL 填 `https://<worker>.<subdomain>.workers.dev/v1`，API Key 使用 `LOGICC_API_KEY`。Anthropic 客户端 Base URL 不带 `/v1`。
+
+### 从已有仓库部署
+
+1. 退出模板部署页面，进入 Cloudflare **Workers & Pages → 创建应用 → 导入仓库**。
+2. 选择自己的 Git 账户和已有的 `logicc2api` 仓库，例如 `JamesZhaoY/logicc2api`。
+3. 填写以下项目配置，然后点击 **保存并部署**：
+
+   | 配置项 | 填写值 |
+   | --- | --- |
+   | Worker 名称 | `logicc2api` |
+   | 生产分支 | `main` |
+   | 根目录 | 仓库根目录，保留默认值 |
+   | 构建命令 | 留空 |
+   | 部署命令 | `npm run deploy` |
+
+4. 在该 Worker 的 **设置 → 变量和机密** 中，以 Secret 类型添加 **运行时密钥** `LOGICC_ADMIN_PASSWORD` 和 `LOGICC_API_KEY`。构建变量/机密仅在构建过程中可用，不会自动成为 Worker 运行时密钥。如果首次构建提示缺少必填 Secret，在这里补齐后重新部署。
+5. 部署成功后，打开 Worker 地址，以 `admin` 登录，再通过控制台添加自己的 Logicc 账号。
+
+Worker 名称必须与 `wrangler.jsonc` 中的 `name` 一致；自定义 Worker 名称时，应同步修改两处。Git 仓库可以保留已有名称。连接后，向 `main` 分支推送代码就会自动构建和部署。如果 Cloudflare 中也已经创建了 Worker，可进入 **该 Worker → 设置 → 构建 → 连接仓库**。详见[官方 Git 集成说明](https://developers.cloudflare.com/workers/ci-cd/builds/)和[构建配置说明](https://developers.cloudflare.com/workers/ci-cd/builds/configuration/)。
+
+### 运行方式与存储
 
 Worker 提供现有管理页面和三种协议接口，包括 SSE 和客户端工具调用。号池、轮换后的 Cookie、请求元数据、助手提示词快照与默认助手保存在 [SQLite Durable Object](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/) 中。每次独立部署有自己的空号池，不会自动导入本地 Docker 的数据。存储与请求占用你自己的 Cloudflare 账户配额。
 

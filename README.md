@@ -4,6 +4,8 @@
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/JamesZhaoY/logicc2api)
 
+This button creates a new Git repository. If you already have this project in your Git account, use [Deploy from an existing repository](#deploy-from-an-existing-repository).
+
 > **Disclaimer:** Please read the [disclaimer and usage responsibilities (Simplified Chinese)](DISCLAIMER.md) before use. It covers account authorization, third-party service risks, data handling, and limitations of liability. The [MIT License](LICENSE) continues to govern the software license.
 
 An OpenAI-compatible adapter for [Logicc](https://app.logicc.com), with account pool management and a web console. Run it with Node.js, Docker, or Cloudflare Workers. It converts Logicc's AI SDK v6 event stream into OpenAI Chat Completions / Responses and Anthropic Messages responses and shows account health, traffic, latency, and request history in one place.
@@ -54,6 +56,17 @@ Native startup binds to `127.0.0.1` by default. Command-line port selection take
 
 ## Cloudflare Workers deployment
 
+Choose the entry point that matches your situation:
+
+| Situation | Entry point | Git repository behavior |
+| --- | --- | --- |
+| Installing the project into your Git account for the first time | **Deploy to Cloudflare** button | Creates a new copy of the repository |
+| You already own or have forked `logicc2api` | Cloudflare **Workers & Pages → Create application → Import a repository** | Connects your existing repository |
+
+The button's **“A repository with this name already exists”** error refers to the GitHub/GitLab repository name: the template flow is trying to create another repository with that name. Deploy your existing repository using the import flow below.
+
+### First-time installation with the deploy button
+
 Click **Deploy to Cloudflare** at the top of this page. The [official deployment flow](https://developers.cloudflare.com/workers/platform/deploy-buttons/) copies this public repository into your GitHub/GitLab account, builds the Worker, and creates its Durable Object binding. No existing server or database setup is required.
 
 1. Sign in to Cloudflare, connect your Git provider, and choose a repository/Worker name.
@@ -68,6 +81,27 @@ Click **Deploy to Cloudflare** at the top of this page. The [official deployment
 4. Open the resulting `https://<worker>.<subdomain>.workers.dev/` address and sign in using the browser's authentication prompt.
 5. Add **your own Logicc account** under **号池管理 → 添加账户**. Account credentials are entered after deployment; they are not supplied by this repository or the deployment button.
 6. Set your OpenAI client's Base URL to `https://<worker>.<subdomain>.workers.dev/v1` and its API key to `LOGICC_API_KEY`. For Anthropic clients, omit `/v1` from the Base URL.
+
+### Deploy from an existing repository
+
+1. Leave the template deployment page. In Cloudflare, open **Workers & Pages → Create application → Import a repository**.
+2. Select your Git account and the existing `logicc2api` repository, for example `JamesZhaoY/logicc2api`.
+3. Configure the project, then select **Save and Deploy**:
+
+   | Setting | Value |
+   | --- | --- |
+   | Worker name | `logicc2api` |
+   | Production branch | `main` |
+   | Root directory | Repository root (default) |
+   | Build command | Leave empty |
+   | Deploy command | `npm run deploy` |
+
+4. Configure `LOGICC_ADMIN_PASSWORD` and `LOGICC_API_KEY` as **runtime secrets** under the Worker's **Settings → Variables and Secrets**. Build variables/secrets only exist during the build and do not automatically become Worker runtime secrets. If the first build reports missing required secrets, add them here and retry the deployment.
+5. Once deployed, open the Worker URL, sign in as `admin`, and add your own Logicc account through the console.
+
+The Worker name must match `name` in `wrangler.jsonc`; update both if you choose a different Worker name. The Git repository itself can keep its existing name. Subsequent pushes to `main` automatically build and deploy this connected Worker. If the Worker already exists in Cloudflare, connect the repository through **that Worker → Settings → Builds → Connect**. See the [official Git integration guide](https://developers.cloudflare.com/workers/ci-cd/builds/) and [build configuration reference](https://developers.cloudflare.com/workers/ci-cd/builds/configuration/).
+
+### Runtime behavior and storage
 
 The Worker serves the existing console and all three APIs, including SSE and client tool calls. Accounts, rotated cookies, request metadata, assistant prompt snapshots, and default assistant selections persist in a [SQLite-backed Durable Object](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/). Each deployment starts with its own empty account pool; it does not import local Docker data. Storage and requests use your Cloudflare account's quotas.
 
