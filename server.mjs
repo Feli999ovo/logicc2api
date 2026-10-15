@@ -4,11 +4,11 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
-import { AccountPool, HttpError, claims, safeError } from './pool.mjs';
+import { AccountPool, HttpError, claims, safeError, deadline } from './pool.mjs';
 import { normalizeRequest, buildPrompt, parseToolOutput, ProtocolOutput, errorPayload } from './protocols.mjs';
 import { AssistantPrompts } from './assistants.mjs';
 
-const ROOT = dirname(fileURLToPath(import.meta.url));
+const ROOT = import.meta.url ? dirname(fileURLToPath(import.meta.url)) : '/';
 
 export async function* parseAiSdkStream(body) {
   const decoder = new TextDecoder();
@@ -64,15 +64,15 @@ function usageOf(event) {
   return { prompt_tokens: input, completion_tokens: output, total_tokens: input + output };
 }
 
-export function createAdapter({ env = process.env, dataFile = env.LOGICC_DATA_FILE || resolve(ROOT, 'data/state.json') } = {}) {
-  const pool = new AccountPool(dataFile, env);
+export function createAdapter({ env = process.env, dataFile = env.LOGICC_DATA_FILE || resolve(ROOT, 'data/state.json'), store } = {}) {
+  const pool = new AccountPool(dataFile, env, store);
   const apiBase = (env.LOGICC_API_BASE || 'https://app.logicc.com/api').replace(/\/+$/, '');
-  const assistantPrompts = new AssistantPrompts(resolve(dirname(dataFile), 'assistant-prompts.json'), upstream);
+  const assistantPrompts = new AssistantPrompts(resolve(dirname(dataFile), 'assistant-prompts.json'), upstream, store);
 
   async function upstream(account, path, { method = 'GET', body, stream = false, signal } = {}, retry = true) {
     const token = await pool.tokenFor(account);
     const response = await fetch(`${apiBase}/${path}`, {
-      method, signal, redirect: 'error',
+      method, signal, redirect: 'manual',
       headers: { Authorization: `Bearer ${token}`, Accept: stream ? 'text/event-stream' : 'application/json',
         ...(stream ? { 'Stream-Response-Protocol': 'ai-sdk-v6' } : {}),
         ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}) },
@@ -111,7 +111,8 @@ export function createAdapter({ env = process.env, dataFile = env.LOGICC_DATA_FI
     const controller = new AbortController();
     const onClose = () => { if (!res.writableEnded) controller.abort(); };
     res.on('close', onClose);
-    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(180000)]);
+    const timeout = deadline(180000);
+    const signal = AbortSignal.any([controller.signal, timeout.signal]);
     let account;
     try {
       account = accountId ? pool.account(accountId) : pool.acquire();
@@ -129,6 +130,7 @@ export function createAdapter({ env = process.env, dataFile = env.LOGICC_DATA_FI
       if (account && error.status !== 499 && !error.noAccountFailure) pool.failed(account, error);
       throw error;
     } finally {
+      timeout.clear();
       res.off('close', onClose);
       trace.durationMs = Date.now() - trace.startedAt;
       if (account) pool.release(account);
@@ -288,7 +290,7 @@ export function createAdapter({ env = process.env, dataFile = env.LOGICC_DATA_FI
         if (assistantRoute) {
           const [, accountId, resource, assistantId] = assistantRoute;
           const account = pool.account(accountId);
-          const signal = AbortSignal.timeout(60000);
+          const timeout = deadline(60000), signal = timeout.signal;
           pool.runtimeFor(accountId).inFlight++;
           try {
             if (resource === 'default-assistant' && !assistantId && req.method === 'PUT') {
@@ -302,7 +304,7 @@ export function createAdapter({ env = process.env, dataFile = env.LOGICC_DATA_FI
               if (assistantId && req.method === 'PUT') return json(res, 200, { assistant: await assistantPrompts.save(account, assistantId, await readJson(req), signal) });
             }
             throw new HttpError(404, '助手管理接口不存在');
-          } finally { pool.release(account); }
+          } finally { timeout.clear(); pool.release(account); }
         }
         if (url.pathname === '/api/accounts' && req.method === 'POST') {
           const input = await readJson(req);
@@ -377,7 +379,7 @@ export function createAdapter({ env = process.env, dataFile = env.LOGICC_DATA_FI
   return { server, pool };
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (import.meta.url && process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const port = Number(process.argv[2] || process.env.PORT || 18789);
   const host = process.env.LOGICC_HOST || '127.0.0.1';
   const { server } = createAdapter();

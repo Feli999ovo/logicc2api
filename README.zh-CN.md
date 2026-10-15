@@ -2,11 +2,13 @@
 
 [English](README.md) · **简体中文**
 
+[![一键部署到 Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/JamesZhaoY/logicc2api)
+
 > **免责声明：** 使用前请阅读[《免责声明与使用责任说明》](DISCLAIMER.md)，了解账户授权、第三方服务风险、数据处理及责任限制。软件许可继续适用 [MIT License](LICENSE)。
 
-为 [Logicc](https://app.logicc.com) 提供 OpenAI 兼容接口的本地代理，内置号池管理和 Web 控制台。将 Logicc 的 AI SDK v6 数据流转换成 OpenAI Chat Completions / Responses 和 Anthropic Messages 响应，集中查看账户状态、流量、模型延迟和请求日志。
+为 [Logicc](https://app.logicc.com) 提供 OpenAI 兼容接口的代理，内置号池管理和 Web 控制台，支持 Node.js、Docker 和 Cloudflare Workers 部署。将 Logicc 的 AI SDK v6 数据流转换成 OpenAI Chat Completions / Responses 和 Anthropic Messages 响应，集中查看账户状态、流量、模型延迟和请求日志。
 
-使用 Node.js 与原生 HTML/CSS/JavaScript 实现。**零运行时依赖，无需数据库，无需前端构建。** 当前页面为简体中文，同时提供中英文介绍文档。
+使用 Node.js 与原生 HTML/CSS/JavaScript 实现。**零第三方运行时依赖，无需手动配置数据库，无需前端构建。** 当前页面为简体中文，同时提供中英文介绍文档。
 
 ## 功能
 
@@ -21,9 +23,10 @@
 | 运行看板 | 请求趋势、成功率、首字延迟和账户可用性 |
 | 模型与日志 | 实时同步模型、统计实际延迟、查看请求详情、筛选和导出 CSV |
 | 请求测试 | 发送真实流式请求、选择上游内置工具、停止本地请求 |
-| 本地存储 | 重启后保留配置和请求元数据，管理接口不返回原始凭据 |
+| 持久化存储 | Node/Docker 使用本地文件，Workers 使用 SQLite Durable Object；管理接口不返回原始 Cookie 和 JWT |
+| Cloudflare 部署 | 一键部署按钮、自动创建存储、控制台密码与独立 API Key |
 
-页面每 5 秒读取本地状态；自动刷新不会调用上游。账号检测和模型同步仅获取模型列表；请求测试会生成内容并消耗上游额度。
+页面每 5 秒读取代理状态；自动刷新不会调用上游。账号检测和模型同步仅获取模型列表；请求测试会生成内容并消耗上游额度。
 
 ## 快速开始
 
@@ -48,6 +51,41 @@ node server.mjs 18790
 ```
 
 直接使用 Node.js 启动时默认监听 `127.0.0.1`，命令行端口优先于环境变量 `PORT`。
+
+## Cloudflare Workers 一键部署
+
+点击文档顶部的 **Deploy to Cloudflare** 按钮。[官方部署流程](https://developers.cloudflare.com/workers/platform/deploy-buttons/)会把公开仓库复制到你的 GitHub/GitLab 账户，构建 Worker 并自动创建 Durable Object 存储绑定，无需预先准备服务器或数据库。
+
+1. 登录 Cloudflare，连接 Git 账户，设置仓库和 Worker 名称。
+2. 在部署页面填写两个 Secret。请生成**两个不同的随机值**，例如执行两次 `openssl rand -hex 32`：
+
+   | Secret | 用途 |
+   | --- | --- |
+   | `LOGICC_ADMIN_PASSWORD` | 管理控制台密码，用户名固定为 **`admin`** |
+   | `LOGICC_API_KEY` | `/v1/*` 客户端访问密钥，与管理密码分开设置 |
+
+3. 部署命令保留 **`npm run deploy`** 或 `npx wrangler deploy`，无需填写构建命令。
+4. 部署完成后，打开 `https://<worker>.<subdomain>.workers.dev/`，在浏览器登录框中输入管理员用户名和密码。
+5. 进入 **号池管理 → 添加账户**，填写**你自己的 Logicc 凭据**。账号在部署后添加，仓库和部署按钮不会附带作者的账号。
+6. OpenAI 客户端 Base URL 填 `https://<worker>.<subdomain>.workers.dev/v1`，API Key 使用 `LOGICC_API_KEY`。Anthropic 客户端 Base URL 不带 `/v1`。
+
+Worker 提供现有管理页面和三种协议接口，包括 SSE 和客户端工具调用。号池、轮换后的 Cookie、请求元数据、助手提示词快照与默认助手保存在 [SQLite Durable Object](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/) 中。每次独立部署有自己的空号池，不会自动导入本地 Docker 的数据。存储与请求占用你自己的 Cloudflare 账户配额。
+
+两个 Secret 均为必填；缺失或为空时服务返回 HTTP 503。控制台和管理接口需要管理员密码，`/v1/*` 需要 API Key。Workers 不提供本机 `/__set_token` 桥接，也不支持外部令牌文件或命令刷新；Cookie 刷新仍可使用。Responses 临时历史保存在内存中，最长保留 30 分钟，对象重启时可能失效；找不到之前的 Response 时，请重新发送完整 `input` 历史。实际调用仍取决于 Logicc 是否接受 Cloudflare 网络的访问。
+
+### 命令行部署与本地测试
+
+```bash
+npm ci
+npx wrangler login
+npx wrangler secret put LOGICC_ADMIN_PASSWORD
+npx wrangler secret put LOGICC_API_KEY
+npm run deploy
+```
+
+首次写入 Secret 时，如果 Wrangler 提示创建 Worker，请确认创建。后续部署会创建 Durable Object。密钥应保存在 [Worker Secrets](https://developers.cloudflare.com/workers/configuration/secrets/) 中，不要写入 `wrangler.jsonc` 或说明文档。
+
+本地开发时，将 `.dev.vars.example` 复制为 `.dev.vars`，填写两个值后运行 `npm run dev:worker`。`.dev.vars` 和 `.wrangler/` 均被 Git 忽略。`npm run test:worker` 使用自动生成的测试凭据和模拟上游检查本地 Workers 运行时，不使用你的 Logicc 账号；`npm run build:worker` 检查部署构建，不会发布服务。
 
 ## Docker 部署
 
@@ -319,9 +357,17 @@ curl http://127.0.0.1:18789/v1/messages \
 
 看板统计保留记录中最近 24 小时的聊天请求。模型同步与账号检测显示在日志中，不计入聊天指标。日志页展示最近 200 条记录。首字延迟包含凭据刷新、建立聊天和网络传输耗时；请求日志不保存提示词与生成的回答。
 
-控制台面向 **单进程本机使用**，没有单独的管理员登录系统。管理请求需要通过本机来源/Host 检查并带有 `X-Logicc-Admin: 1`；`LOGICC_API_KEY` 仅保护 `/v1/*`。兼容入口 `POST /__set_token` 接收原始 JWT，可附加 `?account_id=<id>`，允许 Logicc 页面来源访问，并按 JWT 的 Session ID 匹配账户。
+**Node/Docker 控制台**面向单进程本机使用，没有单独的管理员登录系统。管理请求需要通过本机来源/Host 检查并带有 `X-Logicc-Admin: 1`；`LOGICC_API_KEY` 仅保护 `/v1/*`，不保护本机控制台。本机兼容入口 `POST /__set_token` 接收原始 JWT，可附加 `?account_id=<id>`，允许 Logicc 页面来源访问，并按 JWT 的 Session ID 匹配账户。Workers 使用前文所述的独立密码和持久化存储。
 
 不要让多个实例同时写入同一数据文件。独立实例请分别配置端口和 `LOGICC_DATA_FILE`。
+
+### 防止 Logicc 凭据提交到 Git
+
+`.gitignore` 已排除账号状态、助手快照、`.env*`、`.dev.vars*`、账号与凭据导出、Token/Cookie 文本文件、私钥、浏览器登录状态、HAR/PCAP 抓包、备份和 Wrangler 本地数据。环境文件仅允许提交空值或示例模板。Docker 使用明确的源码白名单；Workers 静态资源限定为 `public/`。
+
+发布前执行 `npm run check:secrets`，仅报告可疑文件名和行号，不输出凭据值。这项检查针对常见格式，不能保证识别所有秘密信息。若真实凭据已被公开，忽略规则不会删除 Git 历史；需要撤销对应 Logicc 会话，并从当前文件及历史中移除暴露内容。
+
+GitHub Actions 在推送和 Pull Request 时自动执行凭据检查、协议测试、Workers 集成测试与部署构建检查。
 
 ## 开发与验证
 
@@ -340,6 +386,9 @@ public/                 无需构建的 Web 控制台
 test/adapter.test.mjs    集成与协议测试
 Dockerfile              非 root 容器镜像和健康检查
 compose.yaml            本机端口映射与号池数据持久化
+worker.mjs              Workers 鉴权入口与持久化号池存储
+wrangler.jsonc          静态资源、Secrets 与自动 Durable Object 迁移
+test/worker.integration.mjs  本地 Workers 运行时集成检查
 ```
 
 ## 许可证

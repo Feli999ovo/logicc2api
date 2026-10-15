@@ -2,9 +2,11 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/JamesZhaoY/logicc2api)
+
 > **Disclaimer:** Please read the [disclaimer and usage responsibilities (Simplified Chinese)](DISCLAIMER.md) before use. It covers account authorization, third-party service risks, data handling, and limitations of liability. The [MIT License](LICENSE) continues to govern the software license.
 
-A local OpenAI-compatible adapter for [Logicc](https://app.logicc.com), with account pool management and a web console. It converts Logicc's AI SDK v6 event stream into OpenAI Chat Completions / Responses and Anthropic Messages responses and shows account health, traffic, latency, and request history in one place.
+An OpenAI-compatible adapter for [Logicc](https://app.logicc.com), with account pool management and a web console. Run it with Node.js, Docker, or Cloudflare Workers. It converts Logicc's AI SDK v6 event stream into OpenAI Chat Completions / Responses and Anthropic Messages responses and shows account health, traffic, latency, and request history in one place.
 
 Built with Node.js and plain HTML/CSS/JavaScript. **No runtime dependencies, database setup, or frontend build step.** The web interface is currently in Simplified Chinese; documentation is available in English and Chinese.
 
@@ -21,9 +23,10 @@ Built with Node.js and plain HTML/CSS/JavaScript. **No runtime dependencies, dat
 | Dashboard | Request trends, success rate, time to first text, and account availability |
 | Models and logs | Live model discovery, observed model latency, request details, filters, and CSV export |
 | Playground | Send a real streaming request, choose an upstream tool, and stop the local request |
-| Local storage | Keep configuration and request metadata across restarts; credentials are omitted from management responses |
+| Persistent storage | Local files for Node/Docker; SQLite-backed Durable Object for Workers; raw cookies and JWTs are omitted from management responses |
+| Cloudflare deployment | Deploy button, automatic resource setup, password-protected console, and a separate API key |
 
-The console polls local state every five seconds. Account checks and model synchronization fetch the upstream model list; the playground sends real generation requests and uses your upstream quota.
+The console polls the adapter every five seconds. Account checks and model synchronization fetch the upstream model list; the playground sends real generation requests and uses your upstream quota.
 
 ## Quick start
 
@@ -48,6 +51,41 @@ node server.mjs 18790
 ```
 
 Native startup binds to `127.0.0.1` by default. Command-line port selection takes precedence over `PORT`.
+
+## Cloudflare Workers deployment
+
+Click **Deploy to Cloudflare** at the top of this page. The [official deployment flow](https://developers.cloudflare.com/workers/platform/deploy-buttons/) copies this public repository into your GitHub/GitLab account, builds the Worker, and creates its Durable Object binding. No existing server or database setup is required.
+
+1. Sign in to Cloudflare, connect your Git provider, and choose a repository/Worker name.
+2. Set the two secrets requested by the deployment form. Generate **two different values**, for example by running `openssl rand -hex 32` twice:
+
+   | Secret | Purpose |
+   | --- | --- |
+   | `LOGICC_ADMIN_PASSWORD` | Console password; the username is **`admin`** |
+   | `LOGICC_API_KEY` | Client API key for `/v1/*`; separate from the console password |
+
+3. Keep the deploy command **`npm run deploy`** (or `npx wrangler deploy`). No build command is needed.
+4. Open the resulting `https://<worker>.<subdomain>.workers.dev/` address and sign in using the browser's authentication prompt.
+5. Add **your own Logicc account** under **号池管理 → 添加账户**. Account credentials are entered after deployment; they are not supplied by this repository or the deployment button.
+6. Set your OpenAI client's Base URL to `https://<worker>.<subdomain>.workers.dev/v1` and its API key to `LOGICC_API_KEY`. For Anthropic clients, omit `/v1` from the Base URL.
+
+The Worker serves the existing console and all three APIs, including SSE and client tool calls. Accounts, rotated cookies, request metadata, assistant prompt snapshots, and default assistant selections persist in a [SQLite-backed Durable Object](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/). Each deployment starts with its own empty account pool; it does not import local Docker data. Storage and requests use your Cloudflare account's quotas.
+
+Both secrets are required: missing/empty values cause HTTP 503. The console and management APIs require the admin password; `/v1/*` requires the API key. The local `/__set_token` bridge and external token-file/command refresh are unavailable in Workers. Cookie-based refresh remains supported. Responses history remains in memory for up to 30 minutes and may be lost on a Durable Object restart; send full `input` history if a previous response is unavailable. Upstream access depends on Logicc accepting requests from Cloudflare's network.
+
+### CLI deployment and local testing
+
+```bash
+npm ci
+npx wrangler login
+npx wrangler secret put LOGICC_ADMIN_PASSWORD
+npx wrangler secret put LOGICC_API_KEY
+npm run deploy
+```
+
+If Wrangler offers to create the Worker while setting the first secret, accept. The subsequent deployment creates the Durable Object. Store values as [Worker secrets](https://developers.cloudflare.com/workers/configuration/secrets/), not in `wrangler.jsonc` or a README.
+
+For local development, copy `.dev.vars.example` to `.dev.vars`, fill in both values, then run `npm run dev:worker`. `.dev.vars` and `.wrangler/` are ignored by Git. `npm run test:worker` exercises the local Workers runtime with generated credentials and a mock upstream; it does not use your Logicc account. `npm run build:worker` validates the deployment bundle without publishing.
 
 ## Docker deployment
 
@@ -319,9 +357,17 @@ Existing saved accounts take precedence over initial environment credentials, so
 
 The dashboard summarizes retained chat records from the previous 24 hours. Model discovery and account checks appear in logs but are excluded from chat metrics. The log page displays the latest 200 records. First-text latency includes credential refresh, chat creation, and network time. Prompts and generated answers are not stored in request logs.
 
-The console is intended for a **single local process**, with no separate admin login. Management requests require the local origin/Host checks and `X-Logicc-Admin: 1`; `LOGICC_API_KEY` protects `/v1/*`, not the console. The compatibility endpoint `POST /__set_token` accepts a raw JWT, optionally with `?account_id=<id>`, and permits the Logicc page origin. JWTs are matched to accounts by Session ID.
+The **Node/Docker console** is intended for a single local process, with no separate admin login. Management requests require the local origin/Host checks and `X-Logicc-Admin: 1`; `LOGICC_API_KEY` protects `/v1/*`, not the local console. The local compatibility endpoint `POST /__set_token` accepts a raw JWT, optionally with `?account_id=<id>`, and permits the Logicc page origin. JWTs are matched to accounts by Session ID. Workers uses the separate password and storage rules described above.
 
 Do not run multiple instances against the same state file. Use separate `LOGICC_DATA_FILE` paths and ports for independent instances.
+
+### Keeping Logicc credentials out of Git
+
+`.gitignore` excludes account state, assistant snapshots, `.env*`, `.dev.vars*`, credential/account exports, token and cookie text files, private keys, browser session state, HAR/PCAP captures, backups, and Wrangler's local state. Only empty/example environment templates are permitted. Docker uses a source-file allowlist; Workers static assets are limited to `public/`.
+
+Before publishing, run `npm run check:secrets`. It reports suspicious filenames and line numbers without printing credential values. This focused check cannot detect every possible secret format. If a real credential has already been published, an ignore rule does not remove Git history; revoke the affected Logicc session and remove exposed content from current files and history.
+
+GitHub Actions runs credential checks, protocol tests, Workers integration tests, and deployment build checks on pushes and pull requests.
 
 ## Development and tests
 
@@ -340,6 +386,9 @@ public/                 Web console, served without a build step
 test/adapter.test.mjs    Integration and protocol checks
 Dockerfile              Non-root container image and service health check
 compose.yaml            Local port mapping and persistent account data
+worker.mjs              Authenticated Workers entry point and durable account storage
+wrangler.jsonc          Worker assets, secrets, and automatic Durable Object migration
+test/worker.integration.mjs  Local Workers runtime integration checks
 ```
 
 ## License

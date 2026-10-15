@@ -53,6 +53,7 @@ async function harness(t,extra={},reply,assistants) {
       return respond(200,{jwt:jwt(session,'refreshed')});
     }
     if(req.url.startsWith('/api/models')){
+      if(sid==='sess_redirect'){res.writeHead(302,{Location:'/redirect-target'});res.end();return;}
       if(sid==='sess_old' && !req.headers.authorization.endsWith('refreshed'))return respond(401,{error:'revoked'});
       if(sid==='sess_limited')return respond(429,{error:'limited'});
       return respond(200,[{id:'test-fast',name:'Test Fast',provider:'test',isDefault:true},{id:'test-slow',provider:'test'}]);
@@ -102,6 +103,14 @@ test('account CRUD, atomic import, credential masking, persistence, validation',
   assert.equal((await api('/api/accounts','POST',{name:'Bad',clientCookie:'x',sessionId:'../etc'})).status,400);
   assert.equal((await api(`/api/accounts/${a.id}`,'DELETE')).status,200);
   const reloaded=new AccountPool(file,{});assert.equal(reloaded.data.accounts.length,1);
+});
+
+test('upstream redirects are rejected without forwarding account credentials', async t => {
+  const { api, add, hits } = await harness(t);
+  await add('Redirect test', 'sess_redirect');
+  const result = await api('/v1/models');
+  assert.equal(result.status, 502);
+  assert.equal(hits.some(hit => hit.url === '/redirect-target'), false);
 });
 
 test('round-robin uses enabled accounts and 429 cools only the affected account',async t=>{

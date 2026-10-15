@@ -26,18 +26,21 @@ function summary(raw) {
 }
 
 export class AssistantPrompts {
-  constructor(file, upstream) {
+  constructor(file, upstream, store) {
     this.file = file;
+    this.store = store;
     this.upstream = upstream;
     this.locks = new Set();
     this.data = { version: 1, defaults: {}, snapshots: [] };
-    if (existsSync(file)) {
-      this.data = JSON.parse(readFileSync(file, 'utf8'));
+    const saved = store ? store.get('assistant-prompts') : existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : undefined;
+    if (saved !== undefined) {
+      this.data = saved;
       if (this.data.version !== 1 || !Array.isArray(this.data.snapshots) || !this.data.defaults || typeof this.data.defaults !== 'object') throw new Error('助手提示词数据格式不正确，原文件未被覆盖');
-      chmodSync(file, 0o600);
+      if (!store) chmodSync(file, 0o600);
     }
   }
   persist() {
+    if (this.store) return this.store.put('assistant-prompts', this.data);
     mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 });
     writeFileSync(this.file + '.tmp', JSON.stringify(this.data, null, 2), { mode: 0o600 });
     chmodSync(this.file + '.tmp', 0o600);

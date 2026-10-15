@@ -20,6 +20,14 @@ export function safeError(error) {
   return String(error?.message || error).replace(/eyJ[\w-]+\.[\w-]+\.[\w-]+/g, '[凭据已隐藏]').slice(0, 350);
 }
 
+// Clear completed request deadlines so idle Durable Objects can be evicted.
+export function deadline(milliseconds) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new DOMException('Request timed out', 'TimeoutError')), milliseconds);
+  timer.unref?.();
+  return { signal: controller.signal, clear: () => clearTimeout(timer) };
+}
+
 function cleanSecret(value, field) {
   if (typeof value !== 'string' || value.length > 20000) throw new HttpError(400, `${field} 格式不正确`);
   const text = value.trim().replace(/^(['"])(.*)\1$/, '$2').replace(/^__client=/, '');
@@ -28,19 +36,21 @@ function cleanSecret(value, field) {
 }
 
 export class AccountPool {
-  constructor(file, env = process.env) {
+  constructor(file, env = process.env, store) {
     this.file = file;
+    this.store = store;
     this.env = env;
     this.cursor = 0;
     this.runtime = new Map();
     this.startedAt = Date.now();
     this.data = { version: 1, accounts: [], requests: [], models: [], modelsUpdatedAt: null };
-    if (existsSync(file)) {
-      this.data = JSON.parse(readFileSync(file, 'utf8'));
+    const saved = store ? store.get('accounts') : existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : undefined;
+    if (saved !== undefined) {
+      this.data = saved;
       if (this.data.version !== 1 || !['accounts', 'requests', 'models'].every(k => Array.isArray(this.data[k]))) {
         throw new Error('号池数据格式不正确，请检查数据文件；原文件未被覆盖。');
       }
-      chmodSync(file, 0o600);
+      if (!store) chmodSync(file, 0o600);
     }
     if (!this.data.accounts.length && (env.LOGICC_CLIENT_COOKIE || env.LOGICC_TOKEN || env.LOGICC_TOKEN_CMD || env.LOGICC_TOKEN_FILE)) {
       let token = env.LOGICC_TOKEN || '';
@@ -56,6 +66,7 @@ export class AccountPool {
   }
 
   save() {
+    if (this.store) return this.store.put('accounts', this.data);
     mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 });
     const temp = `${this.file}.tmp`;
     writeFileSync(temp, JSON.stringify(this.data, null, 2), { mode: 0o600 });
@@ -216,21 +227,24 @@ export class AccountPool {
     }
     if (!account.clientCookie || !account.sessionId) throw new HttpError(401, 'Session JWT 已过期，请更新 JWT 或配置 __client Cookie 与 Session ID');
     const base = (this.env.LOGICC_CLERK_BASE || 'https://clerk.logicc.com').replace(/\/+$/, '');
-    const response = await fetch(`${base}/v1/client/sessions/${encodeURIComponent(account.sessionId)}/tokens`, {
-      method: 'POST', headers: { Cookie: `__client=${account.clientCookie}`, Origin: 'https://app.logicc.com' },
-      signal: AbortSignal.timeout(20000), redirect: 'error',
-    });
-    // Clerk 若轮换客户端凭据，保存响应中的新值，重启后仍使用新值。
-    for (const cookie of response.headers.getSetCookie()) {
-      const match = cookie.match(/^__client=([^;]+)/);
-      if (match) { account.clientCookie = cleanSecret(match[1], '__client'); this.save(); }
-    }
-    if (!response.ok) throw new HttpError(response.status, `凭据刷新失败（HTTP ${response.status}），请更新 __client Cookie / Session ID`);
-    const data = await response.json();
-    if (!fresh(data.jwt) || claims(data.jwt).sid !== account.sessionId) throw new HttpError(401, '上游没有返回属于此账户的有效 Session JWT');
-    account.token = data.jwt;
-    this.save();
-    return account.token;
+    const timeout = deadline(20000);
+    try {
+      const response = await fetch(`${base}/v1/client/sessions/${encodeURIComponent(account.sessionId)}/tokens`, {
+        method: 'POST', headers: { Cookie: `__client=${account.clientCookie}`, Origin: 'https://app.logicc.com' },
+        signal: timeout.signal, redirect: 'manual',
+      });
+      // Clerk 若轮换客户端凭据，保存响应中的新值，重启后仍使用新值。
+      for (const cookie of response.headers.getSetCookie()) {
+        const match = cookie.match(/^__client=([^;]+)/);
+        if (match) { account.clientCookie = cleanSecret(match[1], '__client'); this.save(); }
+      }
+      if (!response.ok) throw new HttpError(response.status, `凭据刷新失败（HTTP ${response.status}），请更新 __client Cookie / Session ID`);
+      const data = await response.json();
+      if (!fresh(data.jwt) || claims(data.jwt).sid !== account.sessionId) throw new HttpError(401, '上游没有返回属于此账户的有效 Session JWT');
+      account.token = data.jwt;
+      this.save();
+      return account.token;
+    } finally { timeout.clear(); }
   }
 
   healthy(account) {
