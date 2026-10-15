@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
 import { AccountPool, HttpError, claims, safeError } from './pool.mjs';
+import { normalizeRequest, buildPrompt, parseToolOutput, ProtocolOutput, errorPayload } from './protocols.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 
@@ -27,27 +28,6 @@ export async function* parseAiSdkStream(body) {
   }
   buffer += decoder.decode();
   if (buffer.trim()) { const event = parse(buffer); if (event) yield event; }
-}
-
-function mapTools(tools) {
-  const builtins = { web_search: 'web-search', 'web-search': 'web-search', image_generation: 'image-generation', 'image-generation': 'image-generation' };
-  let forcedTool;
-  const custom = [];
-  for (const tool of tools || []) {
-    const name = tool?.function?.name ?? tool?.name;
-    if (Object.hasOwn(builtins, name)) forcedTool = builtins[name];
-    else if (tool?.function) custom.push(tool.function);
-  }
-  return { forcedTool, prompt: custom.length ? `\n\n[Tools available — if you need one, respond with a JSON block: {"tool_call": {"name": "<name>", "arguments": {...}}}]\n${JSON.stringify(custom)}` : '' };
-}
-
-function flattenMessages(messages) {
-  return messages.map(message => {
-    if (!message || typeof message.role !== 'string') throw new HttpError(400, 'messages 中的每条消息需要 role');
-    if (message.content != null && typeof message.content !== 'string' && !Array.isArray(message.content)) throw new HttpError(400, '消息 content 必须为文本或内容数组');
-    const content = typeof message.content === 'string' ? message.content : (message.content || []).filter(p => p?.type === 'text').map(p => p.text).join('\n');
-    return message.role === 'user' ? content : `[${message.role}]\n${content}`;
-  }).join('\n\n');
 }
 
 function readBody(req, limit = 1048576) {
@@ -144,7 +124,7 @@ export function createAdapter({ env = process.env, dataFile = env.LOGICC_DATA_FI
       trace.status = error.status === 499 ? 'cancelled' : 'error';
       trace.error = safeError(error);
       trace.httpStatus = error.status || 502;
-      if (account && error.status !== 499) pool.failed(account, error);
+      if (account && error.status !== 499 && !error.noAccountFailure) pool.failed(account, error);
       throw error;
     } finally {
       res.off('close', onClose);
@@ -154,70 +134,111 @@ export function createAdapter({ env = process.env, dataFile = env.LOGICC_DATA_FI
     }
   }
 
-  async function chat(req, res) {
+  // ponytail: bounded in-memory Responses history; use a shared store for multi-process deployments.
+  const responseCache = new Map();
+  let cacheBytes = 0;
+  function dropResponse(id) {
+    const entry = responseCache.get(id);
+    if (entry) { cacheBytes -= entry.bytes; responseCache.delete(id); }
+  }
+  function expireResponses() {
+    for (const [id, entry] of responseCache) if (entry.expiresAt <= Date.now()) dropResponse(id);
+  }
+  function storedResponse(id) {
+    expireResponses();
+    const entry = responseCache.get(id);
+    if (!entry) throw new HttpError(404, 'Response 不存在、未存储或已过期；请发送完整历史 input');
+    return entry;
+  }
+  function rememberResponse(request, output, result) {
+    if (request.protocol !== 'responses' || request.body.store === false) return;
+    expireResponses();
+    const messages = [...request.conversation, output.historyMessage()];
+    const bytes = Buffer.byteLength(JSON.stringify({ messages, result }));
+    while (responseCache.size && (responseCache.size >= 128 || cacheBytes + bytes > 16 * 1024 * 1024)) dropResponse(responseCache.keys().next().value);
+    responseCache.set(result.id, { result, messages, bytes, expiresAt: Date.now() + 30 * 60 * 1000 });
+    cacheBytes += bytes;
+  }
+
+  async function generate(req, res, protocol) {
     const body = await readJson(req);
-    if (!body || typeof body !== 'object' || !Array.isArray(body.messages) || !body.messages.length) throw new HttpError(400, 'messages 需要非空数组');
-    if (body.tools !== undefined && !Array.isArray(body.tools)) throw new HttpError(400, 'tools 必须为数组');
-    if (body.model !== undefined && typeof body.model !== 'string') throw new HttpError(400, 'model 必须为字符串');
-    if (body.stream !== undefined && typeof body.stream !== 'boolean') throw new HttpError(400, 'stream 必须为布尔值');
-    const tools = mapTools(body.tool_choice === 'none' ? [] : body.tools);
-    const prompt = flattenMessages(body.messages) + tools.prompt;
-    if (!prompt.trim()) throw new HttpError(400, '消息内容不能为空');
+    let previous = [];
+    if (protocol === 'responses' && body?.previous_response_id != null) {
+      if (typeof body.previous_response_id !== 'string') throw new HttpError(400, 'previous_response_id 必须为字符串');
+      previous = storedResponse(body.previous_response_id).messages;
+    }
+    const request = normalizeRequest(body, protocol, previous);
+    const prompt = buildPrompt(request);
+    if (Buffer.byteLength(prompt) > 2 * 1024 * 1024) throw new HttpError(413, '合并后的上下文过大，请缩短历史或开始新会话');
     await track(req, res, 'chat', async (account, trace, signal) => {
-      let model = body.model;
-      if (!model || model === 'default') {
+      if (!request.model || request.model === 'default') {
         const models = await modelsFor(account, signal);
-        model = (models.find(m => m.isDefault) || models[0]).id;
+        request.model = (models.find(m => m.isDefault) || models[0]).id;
       }
-      trace.model = model;
-      trace.stream = Boolean(body.stream);
+      trace.model = request.model;
+      trace.stream = request.stream;
+      trace.protocol = protocol;
       const chatResponse = await upstream(account, 'chats', { method: 'POST', body: {}, signal });
       const createdChat = await chatResponse.json();
-      const id = typeof createdChat === 'string' ? createdChat : createdChat.id;
-      if (typeof id !== 'string' || !id) throw new HttpError(502, '上游创建会话未返回 ID');
-      const response = await upstream(account, `chats/${encodeURIComponent(id)}`, {
+      const chatId = typeof createdChat === 'string' ? createdChat : createdChat.id;
+      if (typeof chatId !== 'string' || !chatId) throw new HttpError(502, '上游创建会话未返回 ID');
+      const response = await upstream(account, `chats/${encodeURIComponent(chatId)}`, {
         method: 'POST', stream: true, signal,
-        body: { modelId: model, prompt, isVoicePrompt: false,
-          ...(body.reasoning_effort ? { reasoningEffort: body.reasoning_effort } : {}),
-          ...(tools.forcedTool ? { forcedTool: tools.forcedTool } : {}) },
+        body: { modelId: request.model, prompt, isVoicePrompt: false,
+          ...(request.reasoning ? { reasoningEffort: request.reasoning } : {}),
+          ...(request.forcedTool ? { forcedTool: request.forcedTool } : {}) },
       });
-      const created = Math.floor(Date.now() / 1000);
-      const base = { id: `chatcmpl-${id}`, created, model };
-      const chunk = (delta, finishReason = null) => ({ ...base, object: 'chat.completion.chunk', choices: [{ index: 0, delta, finish_reason: finishReason }] });
-      const send = data => { if (!res.destroyed) res.write(`data: ${JSON.stringify(data)}\n\n`); };
-      let content = '';
-      let finished = false;
-      let finishReason = 'stop';
-      if (body.stream) {
-        res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
-        res.flushHeaders();
-        send(chunk({ role: 'assistant' }));
-      }
-      for await (const event of parseAiSdkStream(response.body)) {
-        if (event.type === 'error') throw new HttpError(502, `上游流错误：${safeError(event.errorText || '未知错误')}`);
-        let delta = '';
-        if (event.type === 'text-delta' && event.delta) {
-          delta = event.delta;
-          trace.ttftMs ??= Date.now() - trace.startedAt;
-        } else if (event.type === 'tool-input-start') delta = `\n[tool:${event.toolName ?? 'unknown'}] `;
-        else if (event.type === 'tool-input-delta') delta = event.inputTextDelta || event.delta || '';
-        if (delta) { if (body.stream) send(chunk({ content: delta })); else content += delta; }
-        const usage = usageOf(event);
-        if (usage) trace.usage = usage;
-        if (event.type === 'finish') {
-          finished = true;
-          finishReason = ['stop', 'length', 'content_filter'].includes(event.finishReason) ? event.finishReason : 'stop';
+      const output = new ProtocolOutput(res, request);
+      let buffered = '', finished = false, finishReason = 'stop', generatedBytes = 0;
+      const nativeCalls = new Map();
+      const toolMode = request.activeTools.length > 0;
+      try {
+        output.start();
+        for await (const event of parseAiSdkStream(response.body)) {
+          if (event.type === 'error') throw new HttpError(502, `上游流错误：${safeError(event.errorText || '未知错误')}`);
+          let delta = '';
+          if (event.type === 'text-delta' && typeof event.delta === 'string') {
+            delta = event.delta;
+            if (delta) trace.ttftMs ??= Date.now() - trace.startedAt;
+          } else if (event.type === 'tool-input-start' || event.type === 'tool-input-available') {
+            const callId = event.toolCallId || event.id;
+            const existing = nativeCalls.get(callId);
+            const name = event.toolName || existing?.name;
+            if (callId && request.activeTools.some(t => t.name === name)) {
+              const call = existing || { name, arguments: '', executed: false };
+              if (event.input !== undefined) call.arguments = event.input;
+              call.executed ||= event.providerExecuted === true;
+              nativeCalls.set(callId, call);
+            } else if (event.type === 'tool-input-start' && request.forcedTool) delta = `\n[tool:${name || request.forcedTool}] `;
+          } else if (event.type === 'tool-input-delta') {
+            const call = nativeCalls.get(event.toolCallId || event.id);
+            if (call && typeof call.arguments === 'string') call.arguments += event.inputTextDelta || event.delta || '';
+          } else if (event.type === 'tool-output-available' || event.type === 'tool-output-error') {
+            const call = nativeCalls.get(event.toolCallId || event.id);
+            if (call) call.executed = true; // Never ask the client to repeat a provider-executed side effect.
+          }
+          if (delta) {
+            generatedBytes += Buffer.byteLength(delta);
+            if (generatedBytes > 1024 * 1024) throw new HttpError(502, '上游输出超过本机代理的 1 MiB 响应限制');
+            if (toolMode) buffered += delta; else output.text(delta);
+          }
+          const usage = usageOf(event);
+          if (usage) trace.usage = usage;
+          if (event.type === 'finish') {
+            finished = true;
+            finishReason = ['stop', 'length', 'content_filter'].includes(event.finishReason) ? event.finishReason : 'stop';
+          }
         }
-      }
-      if (!finished) throw new HttpError(502, '上游数据流提前结束，未收到 finish 事件');
-      const usage = trace.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
-      if (body.stream) {
-        send(chunk({}, finishReason));
-        if (body.stream_options?.include_usage) send({ ...base, object: 'chat.completion.chunk', choices: [], usage });
-        res.end('data: [DONE]\n\n');
-      } else {
-        json(res, 200, { ...base, object: 'chat.completion', choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: finishReason }], usage });
-      }
+        if (!finished) throw new HttpError(502, '上游数据流提前结束，未收到 finish 事件');
+        if (toolMode) {
+          const parsed = parseToolOutput(buffered, request, [...nativeCalls.values()].filter(c => !c.executed));
+          output.text(parsed.text);
+          for (const call of parsed.calls) output.call(call);
+          trace.toolCalls = parsed.calls.length;
+        }
+        output.finish(trace.usage, finishReason, result => rememberResponse(request, output, result));
+      } catch (error) { output.fail(error); throw error; }
+      finally { output.dispose(); }
     });
   }
 
@@ -294,7 +315,8 @@ export function createAdapter({ env = process.env, dataFile = env.LOGICC_DATA_FI
         return json(res, 200, { ok: true, accountId: account.id, exp: claims(token).exp });
       }
       if (url.pathname.startsWith('/v1/') && env.LOGICC_API_KEY) {
-        const incoming = Buffer.from(req.headers.authorization || '');
+        const apiKey = url.pathname.startsWith('/v1/messages') && req.headers['x-api-key'];
+        const incoming = Buffer.from(req.headers.authorization || (apiKey ? `Bearer ${apiKey}` : ''));
         const expected = Buffer.from(`Bearer ${env.LOGICC_API_KEY}`);
         if (incoming.length !== expected.length || !timingSafeEqual(incoming, expected)) throw new HttpError(401, '代理 API Key 不正确');
       }
@@ -302,13 +324,27 @@ export function createAdapter({ env = process.env, dataFile = env.LOGICC_DATA_FI
         const models = await track(req, res, 'models', (account, _trace, signal) => modelsFor(account, signal));
         return json(res, 200, { object: 'list', data: models.map(m => ({ id: m.id, object: 'model', created: 0, owned_by: m.provider })) });
       }
-      if (url.pathname === '/v1/chat/completions' && req.method === 'POST') return await chat(req, res);
+      if (url.pathname === '/v1/messages/count_tokens' && req.method === 'POST') {
+        const request = normalizeRequest(await readJson(req), 'messages');
+        res.setHeader('X-Logicc-Token-Count', 'estimated');
+        return json(res, 200, { input_tokens: Math.max(1, Math.ceil(Buffer.byteLength(buildPrompt(request)) / 3)) });
+      }
+      const responseMatch = /^\/v1\/responses\/(resp_[a-zA-Z0-9]+)$/.exec(url.pathname);
+      if (responseMatch && ['GET', 'DELETE'].includes(req.method)) {
+        const entry = storedResponse(responseMatch[1]);
+        if (req.method === 'GET') return json(res, 200, entry.result);
+        dropResponse(responseMatch[1]);
+        return json(res, 200, { id: responseMatch[1], object: 'response.deleted', deleted: true });
+      }
+      const protocol = { '/v1/chat/completions': 'chat', '/v1/responses': 'responses', '/v1/messages': 'messages' }[url.pathname];
+      if (protocol && req.method === 'POST') return await generate(req, res, protocol);
       throw new HttpError(404, '接口不存在');
     } catch (error) {
       const message = safeError(error);
+      const protocol = req.url?.split('?')[0].startsWith('/v1/messages') ? 'messages' : req.url?.split('?')[0].startsWith('/v1/responses') ? 'responses' : 'chat';
       if (res.headersSent) {
         if (!res.destroyed && !res.writableEnded) res.end(`data: ${JSON.stringify({ error: { message, type: 'adapter_error' } })}\n\ndata: [DONE]\n\n`);
-      } else json(res, error.status >= 400 && error.status <= 599 ? error.status : 502, { error: { message, type: 'adapter_error' } });
+      } else json(res, error.status >= 400 && error.status <= 599 ? error.status : 502, errorPayload(protocol, error));
     }
   });
   return { server, pool };

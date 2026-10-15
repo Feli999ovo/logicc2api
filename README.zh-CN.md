@@ -4,7 +4,7 @@
 
 > **免责声明：** 使用前请阅读[《免责声明与使用责任说明》](DISCLAIMER.md)，了解账户授权、第三方服务风险、数据处理及责任限制。软件许可继续适用 [MIT License](LICENSE)。
 
-为 [Logicc](https://app.logicc.com) 提供 OpenAI 兼容接口的本地代理，内置号池管理和 Web 控制台。将 Logicc 的 AI SDK v6 数据流转换成 OpenAI Chat Completions 响应，集中查看账户状态、流量、模型延迟和请求日志。
+为 [Logicc](https://app.logicc.com) 提供 OpenAI 兼容接口的本地代理，内置号池管理和 Web 控制台。将 Logicc 的 AI SDK v6 数据流转换成 OpenAI Chat Completions / Responses 和 Anthropic Messages 响应，集中查看账户状态、流量、模型延迟和请求日志。
 
 使用 Node.js 与原生 HTML/CSS/JavaScript 实现。**零运行时依赖，无需数据库，无需前端构建。** 当前页面为简体中文，同时提供中英文介绍文档。
 
@@ -12,7 +12,8 @@
 
 | 模块 | 功能说明 |
 | --- | --- |
-| OpenAI 兼容接口 | 模型列表、流式及非流式 Chat Completions |
+| 协议兼容 | 模型列表，Chat Completions、Responses、Messages 的 JSON / SSE 接口 |
+| 客户端工具调用 | 标准 tool_calls / function_call / tool_use，以及工具结果回传 |
 | 号池管理 | 账户增删改、启停、搜索、JSON 批量导入 |
 | 凭据刷新 | 按需刷新 Clerk JWT、合并同账户的并发刷新、保存轮换后的 Cookie |
 | 账户调度 | 最低并发优先，同等并发轮询，异常账户自动冷却 |
@@ -185,14 +186,88 @@ curl -N http://127.0.0.1:18789/v1/chat/completions \
 
 上游提供 token 用量时会转换返回；未提供时，API 兼容响应的计数填零，控制台明确显示用量不可用，不估算用量。
 
-### 工具映射与兼容范围
+### Responses 协议
 
-- `reasoning_effort` 透传给上游。
-- 函数名 `web_search` / `web-search` 映射到上游内置工具 `web-search`；`image_generation` / `image-generation` 映射到 `image-generation`。实际可用性取决于账户和模型。
-- 其他函数定义以 JSON Schema 约定加入提示词，**尚未实现标准 OpenAI `tool_calls` 执行协议**。上游工具事件以 `[tool:web-search]` 等文本标记呈现。
-- 每次请求新建上游聊天，多轮消息合并为单条提示词，不保留上游原生多轮会话状态。
-- 附件未透传；图片工具输出在测试页面中以文本形式展示。
-- 实现了 `/v1/models` 和 `/v1/chat/completions`，并非完整 OpenAI API。
+`POST /v1/responses` 接受字符串或消息数组形式的 `input`，支持 `instructions`、`reasoning.effort`、函数工具、`tool_choice` 和 `stream`。
+
+```bash
+curl http://127.0.0.1:18789/v1/responses \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer local' \
+  -d '{"model":"default","input":"用一句话介绍自己。","stream":true,"store":false}'
+```
+
+流式事件包括 `response.created`、`response.output_text.delta`、`response.function_call_arguments.delta` 和 `response.completed`；失败时发送 `response.failed`。函数调用出现在 `output` 中，类型为 `function_call`；客户端执行后，通过 `function_call_output` 和同一个 `call_id` 回传结果。Responses 的 `custom` 工具也可携带字符串输入，返回 `custom_tool_call`，并接收 `custom_tool_call_output`。
+
+默认 `store: true` 会将 Response 和对话历史临时保存在**进程内存**，最多 30 分钟、128 条或 16 MiB，总量达到限制时淘汰旧项。可用 `previous_response_id` 继续对话，也支持 `GET /v1/responses/{id}` 和 `DELETE /v1/responses/{id}`。重启后缓存清空，缓存不写入号池文件；`store: false` 时不会缓存，客户端需要传完整历史。顶层 `instructions` 不会自动继承到下一次请求。
+
+### Messages 协议
+
+`POST /v1/messages` 支持 `system`、文本内容块、`tools[].input_schema`、`tool_choice`、`tool_use` 和 `tool_result`。配置了代理 API Key 时，可使用 `x-api-key` 或 Bearer 认证。
+
+```bash
+curl http://127.0.0.1:18789/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: local' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"default","max_tokens":512,"stream":true,"messages":[{"role":"user","content":"用一句话介绍自己。"}]}'
+```
+
+使用 SDK 时，OpenAI 的 `baseURL` 填 `http://127.0.0.1:18789/v1`；Anthropic 的 `baseURL` 填 `http://127.0.0.1:18789`，不要重复添加 `/v1`。
+
+流式响应使用 `message_start`、`content_block_start/delta/stop`、`message_delta` 和 `message_stop`。工具参数通过 `input_json_delta` 发送，结束原因为 `tool_use`。客户端执行工具后，将 `tool_result` 放入下一条 user 消息，并用 `tool_use_id` 对应原调用 ID。
+
+`POST /v1/messages/count_tokens` 返回本地估算值，并附带 `X-Logicc-Token-Count: estimated`。该值用于客户端预估上下文大小，不是上游真实 tokenizer 结果，不应用于计费。
+
+### 客户端工具调用
+
+三种协议共用工具转换逻辑，保留调用 ID 和结果关联：
+
+| 协议 | 工具定义 | 模型返回 | 客户端回传 |
+| --- | --- | --- | --- |
+| Chat Completions | `type: function` + `function` | `message.tool_calls`；`finish_reason: tool_calls` | `role: tool` + `tool_call_id` |
+| Responses | `type: function` + 顶层 `name/parameters` | `output[].type: function_call` | `type: function_call_output` + `call_id` |
+| Messages | `name` + `input_schema` | `content[].type: tool_use`；`stop_reason: tool_use` | `type: tool_result` + `tool_use_id` |
+
+以 Chat Completions 为例，请求函数调用：
+
+```json
+{
+  "model": "default",
+  "messages": [{"role": "user", "content": "查询杭州现在的天气，请调用 get_weather。"}],
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "get_weather",
+      "description": "由客户端查询指定城市的实时天气",
+      "parameters": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"]
+      }
+    }
+  }],
+  "tool_choice": "required"
+}
+```
+
+模型返回调用后，由**客户端**执行函数。下一次请求携带原用户消息、包含 `tool_calls` 的 assistant 消息，以及 `role: tool` 的结果消息；不要只发送工具结果，否则缺少上下文和调用 ID 关联。
+
+支持 `auto`、`none`、`required` / Messages `any`、指定工具，以及禁止并行调用。`none` 不会把文本中的 JSON 解释成调用；强制调用未生成有效结果时明确返回错误，不会伪造一次成功调用。参数会检查 JSON 格式、已声明工具名、必填字段、基础类型、枚举和基础对象字段约束。
+
+**实现边界：** Logicc 的当前聊天入口没有开放自定义函数注册，因此本适配器通过结构化提示让模型生成工具请求，再转换成标准协议。普通文本实时转发；带客户端工具的响应会先缓冲并校验 JSON，再发送协议事件。模型遵循程度会影响成功率，不提供原生约束解码、完整 JSON Schema `strict` 或自定义 grammar 的保证。适配器不会执行客户端的 shell、文件或网络工具。
+
+### 上游内置工具与其他限制
+
+- 要调用 Logicc 内置搜索或图片工具，使用 `tools: [{"type":"web_search"}]` 或 `[{"type":"image_generation"}]`；`web_search_preview` 也映射为内置搜索。控制台测试页已使用这种写法。
+- **函数工具即使命名为 `web_search`，也会作为客户端函数返回，不再被替换成上游搜索。** 这是对旧版工具调用行为的修正。
+- 已由上游执行的工具不会重复交给客户端执行；内置工具活动仍可作为文本标记出现在回答中。
+- 每次请求仍新建上游聊天，多轮消息和工具结果会保留角色与 ID 后合并为提示词。
+- `reasoning_effort` / Responses `reasoning.effort` 会透传；不提供跨供应商 reasoning / thinking 内容块。
+- `max_tokens`、`max_completion_tokens`、`max_output_tokens` 作为输出长度提示，不是上游硬性 token 上限。`temperature` / `top_p` 不控制上游采样。
+- 暂不支持附件、Responses JSON Schema 文本输出、后台任务、WebSocket、Conversations API 或完整 OpenAI / Anthropic API。图片工具输出在测试页面中以文本显示。
+
+协议字段参考 [OpenAI Function calling](https://developers.openai.com/api/docs/guides/function-calling)、[Responses 流式事件](https://developers.openai.com/api/reference/resources/responses/streaming-events) 和 [Anthropic Messages 流式协议](https://platform.claude.com/docs/en/build-with-claude/streaming)。
 
 ## 调度与刷新行为
 
@@ -237,10 +312,11 @@ curl -N http://127.0.0.1:18789/v1/chat/completions \
 npm test
 ```
 
-使用 Node 内置测试框架和本机模拟上游，覆盖账户增删改与整批导入、凭据脱敏和文件权限、轮询与冷却、强制刷新与 Cookie 轮换、并发刷新合并、JSON/SSE 转换、工具透传、用量与错误统计、来源限制和异常输入。测试无需真实凭据，不消耗上游额度。
+使用 Node 内置测试框架和本机模拟上游，覆盖账户增删改与整批导入、凭据脱敏和文件权限、轮询与冷却、强制刷新与 Cookie 轮换、并发刷新合并、JSON/SSE 转换、三种协议的工具调用与结果回传、用量与错误统计、来源限制和异常输入。测试无需真实凭据，不消耗上游额度。
 
 ```text
-server.mjs              HTTP 路由、上游调用和协议转换
+server.mjs              HTTP 路由、上游调用和 Responses 临时缓存
+protocols.mjs           三种协议的请求、工具调用与 JSON / SSE 转换
 pool.mjs                账户存储、凭据刷新、调度和统计
 public/                 无需构建的 Web 控制台
 test/adapter.test.mjs    集成与协议测试

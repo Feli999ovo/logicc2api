@@ -11,7 +11,7 @@ import { createAdapter, parseAiSdkStream } from '../server.mjs';
 const jwt = (sid, suffix='initial', exp=Math.floor(Date.now()/1000)+120) => `${Buffer.from('{"alg":"test"}').toString('base64url')}.${Buffer.from(JSON.stringify({sid,exp})).toString('base64url')}.${suffix}`;
 const listen = async server => {server.listen(0,'127.0.0.1');await once(server,'listening');return `http://127.0.0.1:${server.address().port}`;};
 const close = server => new Promise(resolve=>{server.closeAllConnections();server.close(resolve);});
-async function harness(t,extra={}) {
+async function harness(t,extra={},reply) {
   const folder=mkdtempSync(join(tmpdir(),'logicc-test-'));
   const hits=[], tokenCalls=[];
   const mock=createServer(async(req,res)=>{
@@ -35,6 +35,7 @@ async function harness(t,extra={}) {
     if(req.url==='/api/chats')return respond(200,'a-mock-chat-id');
     if(req.url.startsWith('/api/chats/')){
       res.writeHead(200,{'Content-Type':'text/event-stream'});
+      if(reply){for(const event of await reply(body)){res.write(`data: ${JSON.stringify(event)}\n\n`);}res.end();return;}
       if(body.prompt==='ERROR'){res.end('data: {"type":"error","errorText":"mock failure"}\n\n');return;}
       res.write('data: {"type":"text-delta","delta":"你好"}\r\n\r\n');
       if(body.prompt==='TRUNCATED'){res.end();return;}
@@ -110,7 +111,7 @@ test('OpenAI JSON + SSE, UTF-8/CRLF, tools, usage and actual request statistics'
   const completion=await api('/v1/chat/completions','POST',{messages:[{role:'user',content:'你好'}]});
   assert.equal(completion.status,200);assert.equal(completion.data.choices[0].message.content,'你好，测试通过。');
   assert.equal(completion.data.usage.total_tokens,13);
-  const response=await fetch(`${base}/v1/chat/completions`,{method:'POST',body:JSON.stringify({model:'test-fast',stream:true,stream_options:{include_usage:true},messages:[{role:'user',content:'工具测试'}],tools:[{type:'function',function:{name:'web_search'}}]})});
+  const response=await fetch(`${base}/v1/chat/completions`,{method:'POST',body:JSON.stringify({model:'test-fast',stream:true,stream_options:{include_usage:true},messages:[{role:'user',content:'工具测试'}],tools:[{type:'web_search'}]})});
   assert.equal(response.status,200);const text=await response.text();assert.ok(text.endsWith('data: [DONE]\n\n'));
   const frames=text.split('\n\n').filter(f=>f.startsWith('data: {')).map(f=>JSON.parse(f.slice(6)));
   assert.equal(frames[0].choices[0].delta.role,'assistant');assert.ok(frames.some(f=>f.choices[0]?.delta.content?.includes('[tool:web-search]')));
@@ -148,4 +149,161 @@ test('SSE parser supports split multibyte text and unterminated final frames',as
   async function* bytes(){for(const byte of buffer)yield new Uint8Array([byte]);}
   const events=[];for await(const event of parseAiSdkStream(bytes()))events.push(event);
   assert.deepEqual(events,[{type:'text-delta',delta:'中文'},{type:'finish'}]);
+});
+
+const weatherSchema={type:'object',properties:{city:{type:'string'}},required:['city'],additionalProperties:false};
+const chatTools=[{type:'function',function:{name:'get_weather',description:'Get current weather',parameters:weatherSchema}}];
+const responseTools=[{type:'function',name:'get_weather',description:'Get current weather',parameters:weatherSchema}];
+const messageTools=[{name:'get_weather',description:'Get current weather',input_schema:weatherSchema}];
+const textEvents=(text,reason='stop')=>[{type:'text-delta',delta:text.slice(0,12)},{type:'text-delta',delta:text.slice(12)},{type:'finish',finishReason:reason,usage:{inputTokens:5,outputTokens:8}}];
+const toolReply=body=>textEvents('```json\n'+JSON.stringify(body.prompt.includes('"role":"tool"')||body.prompt.includes('[Tool result:') ? {content:'Hangzhou: 21 C',tool_calls:[]} : {content:null,tool_calls:[{name:'get_weather',arguments:{city:'Hangzhou'}}]})+'\n```');
+function sseFrames(text) {
+  return text.split(/\r?\n\r?\n/).filter(frame=>frame.includes('data: {')).map(frame=>{
+    const lines=frame.split(/\r?\n/);return {event:lines.find(l=>l.startsWith('event:'))?.slice(7),data:JSON.parse(lines.find(l=>l.startsWith('data:')).slice(6))};
+  });
+}
+
+test('Chat Completions emits real tool_calls and preserves call IDs through a tool-result round trip',async t=>{
+  const {api,add,hits}=await harness(t,{},toolReply);await add('tools','sess_tools');
+  const request={model:'test-fast',messages:[{role:'user',content:'Get Hangzhou weather'}],tools:chatTools,tool_choice:'required'};
+  const first=await api('/v1/chat/completions','POST',request);
+  assert.equal(first.status,200);const message=first.data.choices[0].message;
+  assert.equal(first.data.choices[0].finish_reason,'tool_calls');assert.equal(message.content,null);
+  assert.equal(message.tool_calls[0].function.name,'get_weather');assert.deepEqual(JSON.parse(message.tool_calls[0].function.arguments),{city:'Hangzhou'});
+  const result=await api('/v1/chat/completions','POST',{...request,tool_choice:'auto',messages:[...request.messages,message,{role:'tool',tool_call_id:message.tool_calls[0].id,content:'21 C'}]});
+  assert.equal(result.status,200);assert.equal(result.data.choices[0].message.content,'Hangzhou: 21 C');assert.equal(result.data.choices[0].finish_reason,'stop');
+  assert.ok(hits.at(-1).body.prompt.includes(message.tool_calls[0].id));assert.ok(hits.at(-1).body.prompt.includes('21 C'));
+});
+
+test('Chat streaming uses indexed tool-call deltas instead of exposing raw JSON as text',async t=>{
+  const {base,add}=await harness(t,{},toolReply);await add('stream tools','sess_toolstream');
+  const response=await fetch(base+'/v1/chat/completions',{method:'POST',body:JSON.stringify({model:'test-fast',stream:true,messages:[{role:'user',content:'Weather'}],tools:chatTools,tool_choice:{type:'function',function:{name:'get_weather'}}})});
+  const text=await response.text(),frames=sseFrames(text).map(f=>f.data);
+  assert.ok(text.endsWith('data: [DONE]\n\n'));assert.ok(frames.every(f=>!f.choices[0]?.delta?.content));
+  const deltas=frames.flatMap(f=>f.choices[0]?.delta?.tool_calls||[]);
+  assert.equal(deltas[0].index,0);assert.ok(deltas[0].id);assert.equal(deltas[0].function.name,'get_weather');
+  assert.deepEqual(JSON.parse(deltas.map(d=>d.function.arguments||'').join('')),{city:'Hangzhou'});
+  assert.equal(frames.at(-1).choices[0].finish_reason,'tool_calls');
+});
+
+test('Responses supports input text, function_call_output, stored continuation, retrieval and deletion',async t=>{
+  const {api,add,hits}=await harness(t,{},toolReply);await add('responses','sess_responses');
+  const first=await api('/v1/responses','POST',{model:'test-fast',instructions:'ONLY_FIRST_INSTRUCTIONS',input:'Weather in Hangzhou',tools:responseTools,tool_choice:'required'});
+  assert.equal(first.status,200);assert.equal(first.data.object,'response');assert.equal(first.data.status,'completed');
+  const call=first.data.output[0];assert.equal(call.type,'function_call');assert.equal(call.name,'get_weather');assert.ok(call.call_id);
+  assert.deepEqual(JSON.parse(call.arguments),{city:'Hangzhou'});assert.equal(first.data.usage.total_tokens,13);
+  assert.equal((await api(`/v1/responses/${first.data.id}`)).data.id,first.data.id);
+  const second=await api('/v1/responses','POST',{model:'test-fast',previous_response_id:first.data.id,input:[{type:'function_call_output',call_id:call.call_id,output:'21 C'}],tools:responseTools});
+  assert.equal(second.status,200);assert.equal(second.data.output[0].content[0].text,'Hangzhou: 21 C');
+  assert.ok(hits.at(-1).body.prompt.includes(call.call_id));assert.ok(!hits.at(-1).body.prompt.includes('ONLY_FIRST_INSTRUCTIONS'));
+  assert.equal((await api(`/v1/responses/${first.data.id}`,'DELETE')).data.deleted,true);
+  assert.equal((await api(`/v1/responses/${first.data.id}`)).status,404);
+  const unStored=await api('/v1/responses','POST',{input:'Weather',tools:responseTools,store:false});
+  assert.equal((await api(`/v1/responses/${unStored.data.id}`)).status,404);
+});
+
+test('Responses SSE emits matching item IDs, argument deltas and a complete final response',async t=>{
+  const {base,add}=await harness(t,{},toolReply);await add('response stream','sess_respstream');
+  const response=await fetch(base+'/v1/responses',{method:'POST',body:JSON.stringify({model:'test-fast',input:[{role:'user',content:[{type:'input_text',text:'Weather'}]}],tools:responseTools,stream:true})});
+  const text=await response.text(),frames=sseFrames(text);
+  assert.equal(frames[0].event,'response.created');assert.equal(frames[1].event,'response.in_progress');
+  const added=frames.find(f=>f.event==='response.output_item.added').data;
+  const delta=frames.find(f=>f.event==='response.function_call_arguments.delta').data;
+  const done=frames.find(f=>f.event==='response.output_item.done').data;
+  assert.equal(delta.item_id,added.item.id);assert.equal(delta.output_index,added.output_index);assert.equal(done.item.call_id,added.item.call_id);
+  assert.deepEqual(JSON.parse(delta.delta),{city:'Hangzhou'});
+  assert.equal(frames.at(-1).event,'response.completed');assert.deepEqual(frames.at(-1).data.response.output[0],done.item);
+  assert.deepEqual(frames.map(f=>f.data.sequence_number),frames.map((_,i)=>i));assert.ok(!text.includes('[DONE]'));
+});
+
+test('Messages supports system text, tool_use, tool_result and x-api-key authentication',async t=>{
+  const {api,add,hits}=await harness(t,{LOGICC_API_KEY:'messages-key'},toolReply);await add('messages','sess_messages');
+  const headers={'x-api-key':'messages-key','anthropic-version':'2023-06-01'};
+  const body={model:'test-fast',system:[{type:'text',text:'SYSTEM_SENTINEL'}],max_tokens:512,messages:[{role:'user',content:'Weather in Hangzhou'}],tools:messageTools,tool_choice:{type:'any'}};
+  assert.equal((await api('/v1/messages','POST',body)).data.error.type,'authentication_error');
+  const first=await api('/v1/messages','POST',body,headers);
+  assert.equal(first.status,200);assert.equal(first.data.type,'message');assert.equal(first.data.stop_reason,'tool_use');
+  const call=first.data.content[0];assert.equal(call.type,'tool_use');assert.equal(call.name,'get_weather');assert.deepEqual(call.input,{city:'Hangzhou'});
+  assert.ok(hits.at(-1).body.prompt.includes('SYSTEM_SENTINEL'));
+  const second=await api('/v1/messages','POST',{...body,tool_choice:{type:'auto'},messages:[...body.messages,{role:'assistant',content:first.data.content},{role:'user',content:[{type:'tool_result',tool_use_id:call.id,content:[{type:'text',text:'21 C'}]}]}]},headers);
+  assert.equal(second.status,200);assert.equal(second.data.stop_reason,'end_turn');assert.equal(second.data.content[0].text,'Hangzhou: 21 C');
+  assert.equal((await api('/v1/messages/count_tokens','POST',body,headers)).status,200);
+});
+
+test('Messages SSE provides complete tool input and stops with tool_use, not text stop',async t=>{
+  const {base,add}=await harness(t,{},toolReply);await add('message stream','sess_msgstream');
+  const response=await fetch(base+'/v1/messages',{method:'POST',body:JSON.stringify({model:'test-fast',max_tokens:128,stream:true,messages:[{role:'user',content:'Weather'}],tools:messageTools,tool_choice:{type:'tool',name:'get_weather'}})});
+  const text=await response.text(),frames=sseFrames(text);
+  assert.deepEqual(frames.map(f=>f.event),['message_start','content_block_start','content_block_delta','content_block_stop','message_delta','message_stop']);
+  assert.equal(frames[0].data.message.stop_reason,null);assert.equal(frames[1].data.content_block.type,'tool_use');
+  assert.deepEqual(JSON.parse(frames[2].data.delta.partial_json),{city:'Hangzhou'});
+  assert.equal(frames[4].data.delta.stop_reason,'tool_use');assert.equal(frames[4].data.usage.output_tokens,8);assert.ok(!text.includes('[DONE]'));
+});
+
+test('new protocols keep ordinary text streaming and emit their own terminal error events',async t=>{
+  for(const protocol of ['responses','messages'])await t.test(protocol,async t=>{
+    const {api,base,add,pool}=await harness(t,{},body=>body.prompt.includes('FAIL_STREAM')?[{type:'error',errorText:'deliberate failure'}]:textEvents('Hello world'));
+    const account=await add(protocol,'sess_plain');
+    const body=protocol==='responses'?{model:'test-fast',input:'hello'}:{model:'test-fast',max_tokens:128,messages:[{role:'user',content:'hello'}]};
+    const response=await api('/v1/'+protocol,'POST',body);assert.equal(response.status,200);
+    const stream=await fetch(base+'/v1/'+protocol,{method:'POST',body:JSON.stringify({...body,stream:true})});
+    const frames=sseFrames(await stream.text());
+    assert.ok(frames.some(f=>f.event===(protocol==='responses'?'response.output_text.delta':'content_block_delta')));
+    assert.equal(frames.at(-1).event,protocol==='responses'?'response.completed':'message_stop');
+    const bad=protocol==='responses'?{...body,input:'FAIL_STREAM'}:{...body,messages:[{role:'user',content:'FAIL_STREAM'}]};
+    const failure=await fetch(base+'/v1/'+protocol,{method:'POST',body:JSON.stringify({...bad,stream:true})});
+    const failedFrames=sseFrames(await failure.text());
+    assert.equal(failedFrames.at(-1).event,protocol==='responses'?'response.failed':'error');
+    assert.ok(!failedFrames.some(f=>['response.completed','message_stop'].includes(f.event)));
+    pool.runtimeFor(account.id).cooldownUntil=0;
+    const badJson=await api('/v1/'+protocol,'POST',null);assert.equal(badJson.status,400);
+    if(protocol==='messages')assert.equal(badJson.data.type,'error');
+  });
+});
+
+test('tool_choice none, required failures and unknown tools do not manufacture successful calls',async t=>{
+  let answer=JSON.stringify({content:null,tool_calls:[{name:'not_declared',arguments:{city:'X'}}]});
+  const {api,add}=await harness(t,{},()=>textEvents(answer));await add('validation','sess_validate');
+  const body={model:'test-fast',messages:[{role:'user',content:'Weather'}],tools:chatTools,tool_choice:'required'};
+  let response=await api('/v1/chat/completions','POST',body);assert.equal(response.status,502);assert.equal(response.data.error.code,'tool_generation_error');
+  answer='I cannot do that';response=await api('/v1/chat/completions','POST',body);assert.equal(response.status,502);
+  response=await api('/v1/chat/completions','POST',{...body,tool_choice:'none'});assert.equal(response.status,200);assert.equal(response.data.choices[0].message.content,answer);assert.equal(response.data.choices[0].message.tool_calls,undefined);
+  answer=JSON.stringify({tool_calls:[{name:'get_weather',arguments:{city:'Hangzhou'}},{name:'get_weather',arguments:{city:'Beijing'}}]});
+  assert.equal((await api('/v1/chat/completions','POST',{...body,parallel_tool_calls:false})).status,502);
+  const valid=await api('/v1/chat/completions','POST',body);assert.equal(valid.data.choices[0].message.tool_calls.length,2);
+  assert.equal((await api('/v1/chat/completions','POST',{...body,tool_choice:{type:'function',function:{name:'unknown'}}})).status,400);
+  assert.equal((await api('/v1/responses','POST',{input:[{type:'function_call_output',call_id:'missing',output:'x'}]})).status,400);
+});
+
+test('native AI SDK client tool inputs are parsed once, and provider-executed calls are not duplicated',async t=>{
+  let executed=false;
+  const {api,add}=await harness(t,{},()=>[
+    {type:'tool-input-start',toolCallId:'native_call',toolName:'get_weather'},
+    {type:'tool-input-delta',toolCallId:'native_call',inputTextDelta:'{"city":'},
+    {type:'tool-input-delta',toolCallId:'native_call',inputTextDelta:'"Hangzhou"}'},
+    {type:'tool-input-available',toolCallId:'native_call',toolName:'get_weather',input:{city:'Hangzhou'}},
+    ...(executed?[{type:'tool-output-available',toolCallId:'native_call',output:'21 C'},{type:'text-delta',delta:'Hangzhou: 21 C'}]:[]),
+    {type:'finish'}]);
+  await add('native','sess_native');
+  const body={model:'test-fast',input:'weather',tools:responseTools};
+  const call=(await api('/v1/responses','POST',body)).data.output[0];assert.equal(call.type,'function_call');assert.deepEqual(JSON.parse(call.arguments),{city:'Hangzhou'});
+  executed=true;const result=(await api('/v1/responses','POST',body)).data;
+  assert.ok(result.output.every(i=>i.type!=='function_call'));assert.equal(result.output[0].content[0].text,'Hangzhou: 21 C');
+});
+
+test('client function named web_search is not silently replaced by upstream web search',async t=>{
+  const {api,add,hits}=await harness(t,{},()=>textEvents(JSON.stringify({tool_calls:[{name:'web_search',arguments:{query:'test'}}]})));
+  await add('client search','sess_search');
+  const response=await api('/v1/chat/completions','POST',{model:'test-fast',messages:[{role:'user',content:'Search'}],tools:[{type:'function',function:{name:'web_search',parameters:{type:'object',properties:{query:{type:'string'}}}}}]});
+  assert.equal(response.data.choices[0].message.tool_calls[0].function.name,'web_search');assert.equal(hits.at(-1).body.forcedTool,undefined);
+});
+
+test('Responses custom tools preserve free-form input and round-trip custom_tool_call_output',async t=>{
+  const {api,add}=await harness(t,{},body=>textEvents(JSON.stringify(body.prompt.includes('"role":"tool"')?{content:'Done',tool_calls:[]}:{tool_calls:[{name:'write_patch',input:'*** Begin Patch\n*** End Patch'}]})));
+  await add('custom','sess_custom');
+  const tools=[{type:'custom',name:'write_patch',description:'Prepare patch text',format:{type:'text'}}];
+  const first=(await api('/v1/responses','POST',{input:'Prepare a patch',tools})).data,call=first.output[0];
+  assert.equal(call.type,'custom_tool_call');assert.ok(call.input.startsWith('*** Begin Patch'));
+  const second=await api('/v1/responses','POST',{previous_response_id:first.id,input:[{type:'custom_tool_call_output',call_id:call.call_id,output:'Applied'}],tools});
+  assert.equal(second.status,200);assert.equal(second.data.output[0].content[0].text,'Done');
 });

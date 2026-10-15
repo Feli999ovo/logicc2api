@@ -4,7 +4,7 @@
 
 > **Disclaimer:** Please read the [disclaimer and usage responsibilities (Simplified Chinese)](DISCLAIMER.md) before use. It covers account authorization, third-party service risks, data handling, and limitations of liability. The [MIT License](LICENSE) continues to govern the software license.
 
-A local OpenAI-compatible adapter for [Logicc](https://app.logicc.com), with account pool management and a web console. It converts Logicc's AI SDK v6 event stream into OpenAI Chat Completions responses and shows account health, traffic, latency, and request history in one place.
+A local OpenAI-compatible adapter for [Logicc](https://app.logicc.com), with account pool management and a web console. It converts Logicc's AI SDK v6 event stream into OpenAI Chat Completions / Responses and Anthropic Messages responses and shows account health, traffic, latency, and request history in one place.
 
 Built with Node.js and plain HTML/CSS/JavaScript. **No runtime dependencies, database setup, or frontend build step.** The web interface is currently in Simplified Chinese; documentation is available in English and Chinese.
 
@@ -12,7 +12,8 @@ Built with Node.js and plain HTML/CSS/JavaScript. **No runtime dependencies, dat
 
 | Area | What it provides |
 | --- | --- |
-| OpenAI-compatible API | Model listing and streaming/non-streaming Chat Completions |
+| Protocol compatibility | Model listing; JSON and SSE for Chat Completions, Responses, and Messages |
+| Client tool calls | Standard tool_calls / function_call / tool_use and matching tool-result round trips |
 | Account pool | Add, edit, remove, enable/disable, search, and bulk-import accounts |
 | Credential refresh | On-demand Clerk JWT refresh, shared concurrent refreshes, and persistence of rotated client cookies |
 | Scheduling | Prefer the least-busy accounts, round-robin between ties, and cool down failing accounts |
@@ -185,14 +186,88 @@ Omitting `model`, or using `default`, selects the upstream default model (or the
 
 Upstream token usage is converted when available. When it is absent, API responses use zero counters for compatibility; the console marks usage as unavailable rather than estimating it.
 
-### Tool mapping and compatibility limits
+### Responses protocol
 
-- `reasoning_effort` is forwarded to the upstream API.
-- Function names `web_search` / `web-search` map to the upstream `web-search` tool; `image_generation` / `image-generation` map to `image-generation`. These invoke upstream built-in tools when available for the account/model.
-- Other function definitions are added to the prompt as a JSON Schema convention. **Standard OpenAI `tool_calls` execution is not implemented.** Upstream tool events appear as text markers such as `[tool:web-search]`.
-- Each request creates a new upstream chat. Conversation messages are combined into one prompt; native upstream multi-turn state is not preserved.
-- Attachments are not forwarded. Image-tool output is displayed as text in the playground.
-- This adapter implements `/v1/models` and `/v1/chat/completions`; it does not implement the entire OpenAI API.
+`POST /v1/responses` accepts string or message-array `input` and supports `instructions`, `reasoning.effort`, function tools, `tool_choice`, and `stream`.
+
+```bash
+curl http://127.0.0.1:18789/v1/responses \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer local' \
+  -d '{"model":"default","input":"Introduce yourself in one sentence.","stream":true,"store":false}'
+```
+
+Streaming includes `response.created`, `response.output_text.delta`, `response.function_call_arguments.delta`, and `response.completed`; failures emit `response.failed`. Function calls appear as `function_call` output items. Execute the function in your client and return `function_call_output` with its `call_id`. Responses `custom` tools support string inputs as `custom_tool_call` items and accept `custom_tool_call_output` results.
+
+The default `store: true` temporarily retains responses and conversation history **in process memory**, bounded to 30 minutes, 128 entries, and 16 MiB with oldest-entry eviction. Continue with `previous_response_id`, retrieve with `GET /v1/responses/{id}`, or delete with `DELETE /v1/responses/{id}`. A restart clears this cache; it is never written to the account file. With `store: false`, send the full conversation history yourself. Top-level `instructions` are not automatically inherited by the next request.
+
+### Messages protocol
+
+`POST /v1/messages` supports `system`, text content blocks, `tools[].input_schema`, `tool_choice`, `tool_use`, and `tool_result`. If a proxy API key is configured, use either `x-api-key` or Bearer authentication.
+
+```bash
+curl http://127.0.0.1:18789/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: local' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"default","max_tokens":512,"stream":true,"messages":[{"role":"user","content":"Introduce yourself in one sentence."}]}'
+```
+
+For SDK configuration, use `http://127.0.0.1:18789/v1` as the OpenAI `baseURL`, and `http://127.0.0.1:18789` as the Anthropic `baseURL` (without `/v1`).
+
+SSE responses use `message_start`, `content_block_start/delta/stop`, `message_delta`, and `message_stop`. Tool arguments are emitted as `input_json_delta`, with `stop_reason: tool_use`. Execute the tool in your client, then send a user message containing `tool_result` with the matching `tool_use_id`.
+
+`POST /v1/messages/count_tokens` returns a local estimate with the header `X-Logicc-Token-Count: estimated`. This helps clients estimate context size; it is not the upstream tokenizer's count and must not be used for billing.
+
+### Client function calling
+
+All three protocols share tool handling and preserve call/result IDs:
+
+| Protocol | Tool definition | Returned call | Client result |
+| --- | --- | --- | --- |
+| Chat Completions | `type: function` and nested `function` | `message.tool_calls`; `finish_reason: tool_calls` | `role: tool` + `tool_call_id` |
+| Responses | `type: function` with top-level `name/parameters` | `output[].type: function_call` | `type: function_call_output` + `call_id` |
+| Messages | `name` + `input_schema` | `content[].type: tool_use`; `stop_reason: tool_use` | `type: tool_result` + `tool_use_id` |
+
+Example Chat Completions function request:
+
+```json
+{
+  "model": "default",
+  "messages": [{"role": "user", "content": "Get the current weather in Hangzhou using get_weather."}],
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "get_weather",
+      "description": "The client looks up live weather for a city",
+      "parameters": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"]
+      }
+    }
+  }],
+  "tool_choice": "required"
+}
+```
+
+Your **client** executes the returned function. Include the original user message, the assistant message containing `tool_calls`, and a `role: tool` result message in the next request. Sending only the result loses the context and call-ID association.
+
+Supported choices include `auto`, `none`, `required` / Messages `any`, named tools, and disabling parallel calls. `none` does not interpret text JSON as an executable call. If a required call cannot be generated, the adapter returns an explicit error rather than fabricating success. Validation covers JSON syntax, declared tool names, required fields, basic types, enum values, and basic object property constraints.
+
+**Implementation boundary:** Logicc's current chat endpoint does not register arbitrary client functions. This adapter uses a structured prompt to generate tool requests and converts them into the client's protocol. Plain text streams immediately; responses with client tools are buffered for JSON validation before protocol events are sent. Reliability depends on the upstream model. This is not native constrained decoding, full JSON Schema `strict` validation, or a custom grammar validator. The adapter never executes your client's shell, file, or network tools.
+
+### Upstream built-ins and remaining limits
+
+- To request Logicc's built-in tools, send `tools: [{"type":"web_search"}]` or `[{"type":"image_generation"}]`; `web_search_preview` also maps to built-in search. The console playground uses this form.
+- **A function named `web_search` remains a client function and is no longer silently replaced by upstream search.** This fixes the previous tool-routing behavior.
+- Provider-executed tools are not executed a second time by the client. Built-in tool activity may still appear as text markers.
+- Each request creates an upstream chat; conversation roles, tool calls, and results are preserved while being serialized into one prompt.
+- `reasoning_effort` / Responses `reasoning.effort` are forwarded; provider-specific reasoning/thinking blocks are not exposed.
+- `max_tokens`, `max_completion_tokens`, and `max_output_tokens` are length instructions, not hard upstream token caps. `temperature` / `top_p` do not control upstream sampling.
+- Attachments, Responses JSON Schema text output, background tasks, WebSockets, the Conversations API, and the complete OpenAI / Anthropic API are not implemented. Image-tool output is displayed as text in the playground.
+
+Protocol references: [OpenAI function calling](https://developers.openai.com/api/docs/guides/function-calling), [Responses streaming events](https://developers.openai.com/api/reference/resources/responses/streaming-events), and [Anthropic Messages streaming](https://platform.claude.com/docs/en/build-with-claude/streaming).
 
 ## Scheduling and refresh behavior
 
@@ -237,10 +312,11 @@ Do not run multiple instances against the same state file. Use separate `LOGICC_
 npm test
 ```
 
-Tests use Node's built-in test runner and a local mock upstream. They cover account CRUD and atomic import, credential masking and file permissions, scheduling and cooldowns, forced refresh and cookie rotation, concurrent refreshes, JSON/SSE conversion, tool forwarding, usage and failure statistics, origin restrictions, and malformed input. They do not need real credentials or consume upstream quota.
+Tests use Node's built-in test runner and a local mock upstream. They cover account CRUD and atomic import, credential masking and file permissions, scheduling and cooldowns, forced refresh and cookie rotation, concurrent refreshes, JSON/SSE conversion, tool-call/result round trips across all three APIs, usage and failure statistics, origin restrictions, and malformed input. They do not need real credentials or consume upstream quota.
 
 ```text
-server.mjs              HTTP routes, upstream requests, and protocol conversion
+server.mjs              HTTP routes, upstream calls, and temporary Responses history
+protocols.mjs           Request, tool-call, JSON, and SSE conversion for all three APIs
 pool.mjs                Account storage, credential refresh, scheduling, and metrics
 public/                 Web console, served without a build step
 test/adapter.test.mjs    Integration and protocol checks

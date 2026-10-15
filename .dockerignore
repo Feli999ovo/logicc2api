@@ -4,6 +4,7 @@
 !package.json
 !server.mjs
 !pool.mjs
+!protocols.mjs
 !LICENSE
 !public/
 !public/**
